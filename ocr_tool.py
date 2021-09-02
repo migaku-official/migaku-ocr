@@ -1,8 +1,8 @@
 import io
 import os
 import platform
+import sys
 from concurrent.futures.thread import ThreadPoolExecutor
-from queue import Queue
 from threading import Thread
 from typing import Optional, cast
 
@@ -13,7 +13,7 @@ import typer
 from notifypy import Notify  # type: ignore
 from PIL import Image
 from pynput import keyboard  # type: ignore
-from PyQt5.QtCore import QBuffer, QRect, Qt
+from PyQt5.QtCore import QBuffer, QObject, QRect, Qt, pyqtSignal
 from PyQt5.QtGui import (
     QColor,
     QMouseEvent,
@@ -26,33 +26,40 @@ from PyQt5.QtWidgets import QApplication, QDialog, QGridLayout, QLabel
 
 typer_app = typer.Typer()
 
-deepl_api_key = ""
 app = QApplication([])
-enclosure_queue: Queue = Queue()
 
 
 @typer_app.command()
-def execute_order66(
-    key_combination: Optional[str] = typer.Argument(None),
-    deepl_api_key_parameter: Optional[str] = typer.Argument(None),
-):
-    global deepl_api_key
-    if type(deepl_api_key_parameter) == str:
-        deepl_api_key = deepl_api_key_parameter
-    hotkey: Optional[keyboard.GlobalHotKeys] = None
-    if not key_combination:
-        hotkey = keyboard.GlobalHotKeys({"<ctrl>+<alt>+1": on_activate_h})
-    if hotkey:
+def execute_order66(key_combination: Optional[str] = typer.Argument(None)):
+    main_hotkey_qobject = MainHotkeyQObject()
+    sys.exit(app.exec_())
+
+
+class MainHotkeyQObject(QObject):
+    def __init__(self):
+        super().__init__()
+
+        manager = KeyBoardManager(self)
+        manager.single_screenshot_signal.connect(take_screenshot)
+        manager.persistent_screenshot_signal.connect(persistent_screenshot_window)
+        manager.start()
+
+
+class KeyBoardManager(QObject):
+    single_screenshot_signal = pyqtSignal()
+    persistent_screenshot_signal = pyqtSignal()
+
+    def start(self):
+        hotkey = keyboard.GlobalHotKeys(
+            {
+                "<ctrl>+<alt>+1": self.single_screenshot_signal.emit,
+                "<ctrl>+<alt>+2": self.persistent_screenshot_signal.emit,
+            },
+        )
         hotkey.start()
 
-    process_queue(enclosure_queue)
 
 
-def process_queue(queue):
-    while True:
-        print("queue:" + queue.get())
-        take_screenshot()
-        queue.task_done()
 
 
 def take_screenshot():
@@ -186,11 +193,6 @@ def convert_to_hiragana(text):
     for item in result:
         result_str += item["hira"]
     return result_str
-
-
-def on_activate_h():
-    print("got hotkey")
-    enclosure_queue.put("stub")
 
 
 if __name__ == "__main__":
