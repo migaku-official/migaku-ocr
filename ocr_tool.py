@@ -13,7 +13,7 @@ import typer
 from notifypy import Notify  # type: ignore
 from PIL import Image
 from pynput import keyboard  # type: ignore
-from PyQt5.QtCore import QBuffer, QObject, QRect, Qt, pyqtSignal
+from PyQt5.QtCore import QBuffer, QObject, QRect, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import (
     QColor,
     QMouseEvent,
@@ -22,16 +22,26 @@ from PyQt5.QtGui import (
     QPaintEvent,
     QPixmap,
 )
-from PyQt5.QtWidgets import QApplication, QDialog, QGridLayout, QLabel
+from PyQt5.QtWidgets import QApplication, QDialog, QGridLayout, QLabel, QWidget
+
+from giant_mess.vncards import OcrAreaDlg
 
 typer_app = typer.Typer()
 
+
 app = QApplication([])
+app.setQuitOnLastWindowClosed(False)
+persistent_window: Optional[OcrAreaDlg] = None
 
 
 @typer_app.command()
 def execute_order66(key_combination: Optional[str] = typer.Argument(None)):
     main_hotkey_qobject = MainHotkeyQObject()
+    # this allows for ctrl-c to close the application
+    timer = QTimer()
+    timer.start(500)
+    timer.timeout.connect(lambda: None)
+
     sys.exit(app.exec_())
 
 
@@ -59,13 +69,81 @@ class KeyBoardManager(QObject):
         hotkey.start()
 
 
+def persistent_screenshot_window():
+    print("persistent start")
 
+    class OcrAreaDlg(QWidget):
+        def __init__(self, x=0, y=0, w=400, h=200, overlay=None):
+            super().__init__()
+            self.setStyleSheet("background:transparent;")
+            self.setAttribute(Qt.WA_TranslucentBackground)
+            self.setWindowFlags(
+                Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Dialog
+            )
+
+            self.is_resizing = False
+
+            self.move(x, y)
+            self.resize(w, h)
+
+            if overlay is None:
+                self.overlay = QPixmap(w, h)
+                self.overlay.fill(Qt.transparent)
+            else:
+                self.overlay = overlay
+
+        def mousePressEvent(self, evt):
+            super().mousePressEvent(evt)
+
+            if evt.button() == Qt.RightButton:
+                self.drag_x = evt.globalX()
+                self.drag_y = evt.globalY()
+                self.drag_w = self.width()
+                self.drag_h = self.height()
+                self.is_resizing = True
+
+        def mouseMoveEvent(self, evt):
+            super().mouseMoveEvent(evt)
+
+            if self.is_resizing:
+                w = max(50, self.drag_w + evt.globalX() - self.drag_x)
+                h = max(50, self.drag_h + evt.globalY() - self.drag_y)
+                self.resize(w, h)
+                self.overlay = QPixmap(w, h)
+                self.overlay.fill(Qt.transparent)
+
+        def mouseReleaseEvent(self, evt):
+            super().mouseReleaseEvent(evt)
+
+            self.is_resizing = False
+
+        def accept(self):
+
+            self.res_x = self.x()
+            self.res_y = self.y()
+            self.res_w = self.width()
+            self.res_h = self.height()
+            self.res_overlay = self.overlay
+            super().accept()
+
+        def keyPressEvent(self, evt):
+
+            # if evt.key() in [Qt.Key_Return, Qt.Key_Enter]:
+            #     self.accept()
+
+            if evt.key() in [Qt.Key_Escape]:
+                self.close()
+
+    global persistent_window
+    persistent_window = OcrAreaDlg()
+    persistent_window.show()
 
 
 def take_screenshot():
     QApplication.setOverrideCursor(Qt.CrossCursor)
     ex = SelectorWidget(app)
     ex.show()
+    ex.activateWindow()
     if ex.exec() == QDialog.Accepted:
         if ex.selectedPixmap:
             image = convert_qpixmap_to_pil_image(ex.selectedPixmap)
@@ -155,8 +233,8 @@ class SelectorWidget(QDialog):
         self.selectedPixmap = None
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            self.close()
+        if event.key() in [Qt.Key_Escape]:
+            self.reject()
 
     def mousePressEvent(self, event: QMouseEvent):
         self.selectedRect.setTopLeft(event.globalPos())
