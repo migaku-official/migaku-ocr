@@ -8,39 +8,227 @@ from typing import Optional, cast
 
 import pykakasi
 import pyperclip  # type: ignore
+import pyscreenshot as ImageGrab
 import pytesseract  # type: ignore
 import typer
 from notifypy import Notify  # type: ignore
-from PIL import Image
+from PIL import Image, ImageOps
 from pynput import keyboard  # type: ignore
 from PyQt5.QtCore import QBuffer, QObject, QRect, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import (
     QColor,
+    QCursor,
+    QIcon,
     QMouseEvent,
     QPainter,
     QPainterPath,
     QPaintEvent,
     QPixmap,
 )
-from PyQt5.QtWidgets import QApplication, QDialog, QGridLayout, QLabel, QWidget
+from PyQt5.QtWidgets import (
+    QAction,
+    QApplication,
+    QDialog,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QMenu,
+    QPushButton,
+    QSystemTrayIcon,
+    QVBoxLayout,
+    QWidget,
+)
 
-from giant_mess.vncards import OcrAreaDlg
+closed_persistent_window_x1 = 0
+closed_persistent_window_y1 = 0
+closed_persistent_window_x2 = 0
+closed_persistent_window_y2 = 0
+
+
+class PersistentWindow(QWidget):
+    def __init__(self, x=0, y=0, w=400, h=200, overlay=None):
+        super().__init__()
+        self.setWindowTitle("Migaku OCR")
+
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Dialog
+        )
+
+        self.is_resizing = False
+        self.is_moving = False
+
+        self.move(x, y)
+        self.resize(w, h)
+        self.setMouseTracking(True)
+        self.original_cursor_x = 0
+        self.original_cursor_y = 0
+        self.original_window_x = 0
+        self.original_window_y = 0
+        self.setAttribute(Qt.WA_TranslucentBackground)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        innerWidget = QWidget()
+        innerWidget.setObjectName("innerWidget")
+        innerWidget.setStyleSheet(
+            """
+                QWidget#innerWidget {
+                    border: 2px solid rgba(255, 255, 255, 0.08);
+
+                }
+                QWidget#innerWidget::hover {
+                    border: 1px solid rgb(255, 255, 255);
+                }
+            """
+        )
+        middleWidget = QWidget()
+        middleWidget.setObjectName("middleWidget")
+        middleWidget.setStyleSheet(
+            """
+                QWidget#middleWidget {
+                    border: 2px solid rgba(0, 0, 0, 0.3);
+
+                }
+                QWidget#middleWidget::hover {
+                    border: 2px solid rgb(0, 0, 0);
+                }
+            """
+        )
+        middleLayout = QHBoxLayout()
+        middleWidget.setLayout(middleLayout)
+        middleLayout.setContentsMargins(0, 0, 0, 0)
+        innerLayout = QHBoxLayout()
+        ocrButton = QPushButton()
+        ocrButton.setIcon(QIcon("ocr_icon.png"))
+        ocrButton.clicked.connect(take_screenshot_from_persistent_window)
+        ocrButton.setStyleSheet(
+            """
+                QPushButton {
+                    background-color: white;
+                    padding: 0px;
+                }
+            """
+        )
+
+        self.ocrButton = ocrButton
+        innerLayout.setContentsMargins(1, 1, 1, 1)
+        ocrButton.hide()
+
+        middleLayout.addWidget(innerWidget)
+        innerLayout.addWidget(ocrButton, alignment=Qt.AlignRight | Qt.AlignBottom)
+        innerWidget.setLayout(innerLayout)
+        layout.addWidget(middleWidget)
+        self.setLayout(layout)
+
+    def mousePressEvent(self, evt):
+        super().mousePressEvent(evt)
+
+        if evt.button() == Qt.LeftButton:
+            self.is_moving = True
+            cursor_position = QCursor.pos()
+            self.original_cursor_x = cursor_position.x()
+            self.original_cursor_y = cursor_position.y()
+            window_position = self.pos()
+            self.original_window_x = window_position.x()
+            self.original_window_y = window_position.y()
+            QApplication.setOverrideCursor(Qt.ClosedHandCursor)
+
+        if evt.button() == Qt.RightButton:
+            self.drag_x = evt.globalX()
+            self.drag_y = evt.globalY()
+            self.drag_w = self.width()
+            self.drag_h = self.height()
+            self.is_resizing = True
+
+    def enterEvent(self, event):
+        self.ocrButton.show()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.ocrButton.hide()
+        super().leaveEvent(event)
+
+    def mouseMoveEvent(self, evt):
+        super().mouseMoveEvent(evt)
+
+        if self.is_moving:
+            position = QCursor.pos()
+            distance_x = self.original_cursor_x - position.x()
+            distance_y = self.original_cursor_y - position.y()
+            new_x = self.original_window_x - distance_x
+            new_y = self.original_window_y - distance_y
+            self.move(new_x, new_y)
+
+        if self.is_resizing:
+            w = max(50, self.drag_w + evt.globalX() - self.drag_x)
+            h = max(50, self.drag_h + evt.globalY() - self.drag_y)
+            self.resize(w, h)
+            self.overlay = QPixmap(w, h)
+            self.overlay.fill(Qt.transparent)
+
+    def mouseReleaseEvent(self, evt):
+        super().mouseReleaseEvent(evt)
+        self.is_moving = False
+        self.is_resizing = False
+        QApplication.restoreOverrideCursor()
+
+    def accept(self):
+
+        self.res_x = self.x()
+        self.res_y = self.y()
+        self.res_w = self.width()
+        self.res_h = self.height()
+        self.res_overlay = self.overlay
+        super().accept()
+
+    def keyPressEvent(self, evt):
+
+        if evt.key() in [Qt.Key_Return, Qt.Key_Enter]:
+            global closed_persistent_window_x1
+            global closed_persistent_window_y1
+            global closed_persistent_window_x2
+            global closed_persistent_window_y2
+            closed_persistent_window_x1 = self.x()
+            closed_persistent_window_y1 = self.y()
+            closed_persistent_window_x2 = closed_persistent_window_x1 + self.width()
+            closed_persistent_window_y2 = closed_persistent_window_y1 + self.height()
+
+            self.close()
+
+        if evt.key() in [Qt.Key_Escape]:
+            self.close()
+
 
 typer_app = typer.Typer()
 
 
-app = QApplication([])
+app = QApplication(sys.argv)
 app.setQuitOnLastWindowClosed(False)
-persistent_window: Optional[OcrAreaDlg] = None
+
+persistent_window: Optional[PersistentWindow] = None
 
 
 @typer_app.command()
 def execute_order66(key_combination: Optional[str] = typer.Argument(None)):
     main_hotkey_qobject = MainHotkeyQObject()
+
     # this allows for ctrl-c to close the application
     timer = QTimer()
     timer.start(500)
     timer.timeout.connect(lambda: None)
+
+    icon = QIcon("migaku_icon.png")
+
+    tray = QSystemTrayIcon()
+    tray.setIcon(icon)
+    tray.setVisible(True)
+    menu = QMenu()
+
+    quit = QAction("Quit")
+    quit.triggered.connect(app.quit)
+    menu.addAction(quit)
+
+    tray.setContextMenu(menu)
 
     sys.exit(app.exec_())
 
@@ -51,91 +239,76 @@ class MainHotkeyQObject(QObject):
 
         manager = KeyBoardManager(self)
         manager.single_screenshot_signal.connect(take_screenshot)
-        manager.persistent_screenshot_signal.connect(persistent_screenshot_window)
+        manager.persistent_window_signal.connect(show_persistent_screenshot_window)
+        manager.persistent_screenshot_signal.connect(
+            take_screenshot_from_persistent_window
+        )
         manager.start()
 
 
 class KeyBoardManager(QObject):
     single_screenshot_signal = pyqtSignal()
+    persistent_window_signal = pyqtSignal()
     persistent_screenshot_signal = pyqtSignal()
 
     def start(self):
         hotkey = keyboard.GlobalHotKeys(
             {
                 "<ctrl>+<alt>+1": self.single_screenshot_signal.emit,
-                "<ctrl>+<alt>+2": self.persistent_screenshot_signal.emit,
+                "<ctrl>+<alt>+2": self.persistent_window_signal.emit,
+                "<ctrl>+<alt>+3": self.persistent_screenshot_signal.emit,
             },
         )
         hotkey.start()
 
 
-def persistent_screenshot_window():
-    print("persistent start")
-
-    class OcrAreaDlg(QWidget):
-        def __init__(self, x=0, y=0, w=400, h=200, overlay=None):
-            super().__init__()
-            self.setStyleSheet("background:transparent;")
-            self.setAttribute(Qt.WA_TranslucentBackground)
-            self.setWindowFlags(
-                Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Dialog
-            )
-
-            self.is_resizing = False
-
-            self.move(x, y)
-            self.resize(w, h)
-
-            if overlay is None:
-                self.overlay = QPixmap(w, h)
-                self.overlay.fill(Qt.transparent)
-            else:
-                self.overlay = overlay
-
-        def mousePressEvent(self, evt):
-            super().mousePressEvent(evt)
-
-            if evt.button() == Qt.RightButton:
-                self.drag_x = evt.globalX()
-                self.drag_y = evt.globalY()
-                self.drag_w = self.width()
-                self.drag_h = self.height()
-                self.is_resizing = True
-
-        def mouseMoveEvent(self, evt):
-            super().mouseMoveEvent(evt)
-
-            if self.is_resizing:
-                w = max(50, self.drag_w + evt.globalX() - self.drag_x)
-                h = max(50, self.drag_h + evt.globalY() - self.drag_y)
-                self.resize(w, h)
-                self.overlay = QPixmap(w, h)
-                self.overlay.fill(Qt.transparent)
-
-        def mouseReleaseEvent(self, evt):
-            super().mouseReleaseEvent(evt)
-
-            self.is_resizing = False
-
-        def accept(self):
-
-            self.res_x = self.x()
-            self.res_y = self.y()
-            self.res_w = self.width()
-            self.res_h = self.height()
-            self.res_overlay = self.overlay
-            super().accept()
-
-        def keyPressEvent(self, evt):
-
-            # if evt.key() in [Qt.Key_Return, Qt.Key_Enter]:
-            #     self.accept()
-
-            if evt.key() in [Qt.Key_Escape]:
-                self.close()
-
+def take_screenshot_from_persistent_window():
     global persistent_window
-    persistent_window = OcrAreaDlg()
+    global closed_persistent_window_x1
+    global closed_persistent_window_y1
+    global closed_persistent_window_x2
+    global closed_persistent_window_y2
+    if not persistent_window and (
+        not closed_persistent_window_x1
+        and not closed_persistent_window_y1
+        and not closed_persistent_window_x2
+        and not closed_persistent_window_y2
+    ):
+        print(
+            "persistent window not initialized yet or persistent_window location not saved"
+        )
+    else:
+        if persistent_window:
+            x1 = persistent_window.x()
+            y1 = persistent_window.y()
+            x2 = x1 + persistent_window.width()
+            y2 = y1 + persistent_window.height()
+        else:
+            x1 = closed_persistent_window_x1
+            y1 = closed_persistent_window_y1
+            x2 = closed_persistent_window_x2
+            y2 = closed_persistent_window_y2
+        image = ImageGrab.grab(bbox=(x1, y1, x2, y2))
+        if persistent_window and persistent_window.ocrButton.isVisible():
+            button = persistent_window.ocrButton
+            x1 = button.x()
+            y1 = button.y()
+            width = button.width()
+            height = button.height()
+            color = image.getpixel((x1 - 1, y1 + height - 2))
+            for x in range(width):
+                for y in range(height):
+                    image.putpixel((x1 + x, y1 + y), color)
+        image = ImageOps.grayscale(image)
+        image.save("test.png")
+
+        process = Thread(target=start_ocr, args=(image,))
+        process.start()
+
+
+def show_persistent_screenshot_window():
+    global persistent_window
+    persistent_window = PersistentWindow()
     persistent_window.show()
 
 
@@ -149,6 +322,7 @@ def take_screenshot():
             image = convert_qpixmap_to_pil_image(ex.selectedPixmap)
             process = Thread(target=start_ocr, args=(image,))
             process.start()
+    QApplication.restoreOverrideCursor()
 
 
 def start_ocr(image):
@@ -157,7 +331,7 @@ def start_ocr(image):
 
 
 def process_image(image):
-    # image = ImageOps.grayscale(image)
+    image = ImageOps.grayscale(image)
     width, height = image.size
     language = ""
     if platform.system() == "Windows":
@@ -173,7 +347,7 @@ def process_image(image):
     text = cast(str, text)
     text = text.strip()
 
-    for (f, t) in [(" ", ""), ("いぃ", "い")]:
+    for (f, t) in [(" ", ""), ("いぃ", "い"), ("\n", "")]:
         text = text.replace(f, t)
     print(text)
     return text
