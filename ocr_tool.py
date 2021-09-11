@@ -1,5 +1,6 @@
 import io
 import os
+import pathlib
 import platform
 import sys
 from concurrent.futures.thread import ThreadPoolExecutor
@@ -10,7 +11,9 @@ import pykakasi
 import pyperclip  # type: ignore
 import pyscreenshot as ImageGrab
 import pytesseract  # type: ignore
+import toml
 import typer
+from appdirs import user_config_dir
 from notifypy import Notify  # type: ignore
 from PIL import Image, ImageOps
 from pynput import keyboard  # type: ignore
@@ -43,6 +46,16 @@ closed_persistent_window_x1 = 0
 closed_persistent_window_y1 = 0
 closed_persistent_window_x2 = 0
 closed_persistent_window_y2 = 0
+
+default_settings = {
+    "hotkeys": {
+        "single_screenshot_hotkey": "<ctrl>+<alt>+Q",
+        "persistent_window_hotkey": "<ctrl>+<alt>+W",
+        "persistent_screenshot_hotkey": "<ctrl>+<alt>+E",
+    }
+}
+
+global_config_dict = {}
 
 
 class PersistentWindow(QWidget):
@@ -210,6 +223,7 @@ persistent_window: Optional[PersistentWindow] = None
 
 @typer_app.command()
 def execute_order66(key_combination: Optional[str] = typer.Argument(None)):
+    load_config()
     main_hotkey_qobject = MainHotkeyQObject()
 
     # this allows for ctrl-c to close the application
@@ -233,6 +247,31 @@ def execute_order66(key_combination: Optional[str] = typer.Argument(None)):
     sys.exit(app.exec_())
 
 
+def load_config():
+    config_dir = user_config_dir("migaku-ocr")
+    pathlib.Path(config_dir).mkdir(parents=True, exist_ok=True)
+    config_file = os.path.join(config_dir, "config.toml")
+    global global_config_dict
+    try:
+        with open(config_file, "r") as f:
+            config_text = f.read()
+        global_config_dict = toml.loads(config_text)
+    except FileNotFoundError:
+        print("no config file exists, loading default values")
+        global default_settings
+        global_config_dict = default_settings
+
+
+def save_config():
+    config_dir = user_config_dir("migaku-ocr")
+    pathlib.Path(config_dir).mkdir(parents=True, exist_ok=True)
+    config_file = os.path.join(config_dir, "config.toml")
+    global global_config_dict
+    with open(config_file, "w") as f:
+        config_text = f.read()
+    global_config_dict = toml.loads(config_text)
+
+
 class MainHotkeyQObject(QObject):
     def __init__(self):
         super().__init__()
@@ -252,13 +291,24 @@ class KeyBoardManager(QObject):
     persistent_screenshot_signal = pyqtSignal()
 
     def start(self):
-        hotkey = keyboard.GlobalHotKeys(
-            {
-                "<ctrl>+<alt>+1": self.single_screenshot_signal.emit,
-                "<ctrl>+<alt>+2": self.persistent_window_signal.emit,
-                "<ctrl>+<alt>+3": self.persistent_screenshot_signal.emit,
-            },
-        )
+        global global_config_dict
+        hotkey_config = global_config_dict["hotkeys"]
+        hotkey_dict = {}
+        if hotkey_config["single_screenshot_hotkey"]:
+            hotkey_dict[
+                hotkey_config["single_screenshot_hotkey"]
+            ] = self.single_screenshot_signal.emit
+        if hotkey_config["persistent_window_hotkey"]:
+            hotkey_dict[
+                hotkey_config["persistent_window_hotkey"]
+            ] = self.persistent_window_signal.emit
+        if hotkey_config["persistent_screenshot_hotkey"]:
+            hotkey_dict[
+                hotkey_config["persistent_screenshot_hotkey"]
+            ] = self.persistent_screenshot_signal.emit
+
+        print(hotkey_dict)
+        hotkey = keyboard.GlobalHotKeys(hotkey_dict)
         hotkey.start()
 
 
