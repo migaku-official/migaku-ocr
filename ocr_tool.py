@@ -52,10 +52,17 @@ default_settings = {
         "single_screenshot_hotkey": "<ctrl>+<alt>+Q",
         "persistent_window_hotkey": "<ctrl>+<alt>+W",
         "persistent_screenshot_hotkey": "<ctrl>+<alt>+E",
-    }
+    },
+    "ocr_settings": {"grayscale": False},
 }
 
 global_config_dict = {}
+
+
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Migaku OCR")
 
 
 class PersistentWindow(QWidget):
@@ -165,34 +172,33 @@ class PersistentWindow(QWidget):
         super().mouseMoveEvent(evt)
 
         if self.is_moving:
-            position = QCursor.pos()
-            distance_x = self.original_cursor_x - position.x()
-            distance_y = self.original_cursor_y - position.y()
-            new_x = self.original_window_x - distance_x
-            new_y = self.original_window_y - distance_y
-            self.move(new_x, new_y)
+
+            def make_window_follow_cursor():
+                position = QCursor.pos()
+                distance_x = self.original_cursor_x - position.x()
+                distance_y = self.original_cursor_y - position.y()
+                new_x = self.original_window_x - distance_x
+                new_y = self.original_window_y - distance_y
+                self.move(new_x, new_y)
+
+            make_window_follow_cursor()
 
         if self.is_resizing:
-            w = max(50, self.drag_w + evt.globalX() - self.drag_x)
-            h = max(50, self.drag_h + evt.globalY() - self.drag_y)
-            self.resize(w, h)
-            self.overlay = QPixmap(w, h)
-            self.overlay.fill(Qt.transparent)
+
+            def make_size_follow_cursor():
+                w = max(50, self.drag_w + evt.globalX() - self.drag_x)
+                h = max(50, self.drag_h + evt.globalY() - self.drag_y)
+                self.resize(w, h)
+                self.overlay = QPixmap(w, h)
+                self.overlay.fill(Qt.transparent)
+
+            make_size_follow_cursor()
 
     def mouseReleaseEvent(self, evt):
         super().mouseReleaseEvent(evt)
         self.is_moving = False
         self.is_resizing = False
         QApplication.restoreOverrideCursor()
-
-    def accept(self):
-
-        self.res_x = self.x()
-        self.res_y = self.y()
-        self.res_w = self.width()
-        self.res_h = self.height()
-        self.res_overlay = self.overlay
-        super().accept()
 
     def keyPressEvent(self, evt):
 
@@ -252,14 +258,14 @@ def load_config():
     pathlib.Path(config_dir).mkdir(parents=True, exist_ok=True)
     config_file = os.path.join(config_dir, "config.toml")
     global global_config_dict
+    global_config_dict = default_settings
     try:
         with open(config_file, "r") as f:
             config_text = f.read()
-        global_config_dict = toml.loads(config_text)
+        # merge default config and user config, user config has precedence; python3.9+ only
+        global_config_dict = global_config_dict | toml.loads(config_text)
     except FileNotFoundError:
         print("no config file exists, loading default values")
-        global default_settings
-        global_config_dict = default_settings
 
 
 def save_config():
@@ -268,8 +274,7 @@ def save_config():
     config_file = os.path.join(config_dir, "config.toml")
     global global_config_dict
     with open(config_file, "w") as f:
-        config_text = f.read()
-    global_config_dict = toml.loads(config_text)
+        toml.dump(global_config_dict, f)
 
 
 class MainHotkeyQObject(QObject):
@@ -293,6 +298,7 @@ class KeyBoardManager(QObject):
     def start(self):
         global global_config_dict
         hotkey_config = global_config_dict["hotkeys"]
+        # this puts the the user hotkeys into the following format: https://tinyurl.com/vzs2a2rd
         hotkey_dict = {}
         if hotkey_config["single_screenshot_hotkey"]:
             hotkey_dict[
@@ -307,7 +313,6 @@ class KeyBoardManager(QObject):
                 hotkey_config["persistent_screenshot_hotkey"]
             ] = self.persistent_screenshot_signal.emit
 
-        print(hotkey_dict)
         hotkey = keyboard.GlobalHotKeys(hotkey_dict)
         hotkey.start()
 
@@ -349,8 +354,6 @@ def take_screenshot_from_persistent_window():
             for x in range(width):
                 for y in range(height):
                     image.putpixel((x1 + x, y1 + y), color)
-        image = ImageOps.grayscale(image)
-        image.save("test.png")
 
         process = Thread(target=start_ocr, args=(image,))
         process.start()
@@ -375,13 +378,15 @@ def take_screenshot():
     QApplication.restoreOverrideCursor()
 
 
-def start_ocr(image):
+def start_ocr(image: Image.Image):
     text = process_image(image)
     process_text(text)
 
 
-def process_image(image):
-    image = ImageOps.grayscale(image)
+def process_image(image: Image.Image):
+    if global_config_dict["ocr_settings"]["grayscale"]:
+        image = ImageOps.grayscale(image)
+    image.save("debug.png")
     width, height = image.size
     language = ""
     if platform.system() == "Windows":
