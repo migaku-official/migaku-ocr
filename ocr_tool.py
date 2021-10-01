@@ -1,11 +1,13 @@
+import copy
 import io
 import os
 import pathlib
 import platform
+import re
 import sys
 from concurrent.futures.thread import ThreadPoolExecutor
 from threading import Thread
-from typing import Optional, cast
+from typing import Any, Optional, cast
 
 import pykakasi
 import pyperclip  # type: ignore
@@ -13,28 +15,21 @@ import pyscreenshot as ImageGrab
 import pytesseract  # type: ignore
 import toml
 import typer
-from appdirs import user_config_dir
+from appdirs import user_config_dir  # type: ignore
 from notifypy import Notify  # type: ignore
 from PIL import Image, ImageOps
 from pynput import keyboard  # type: ignore
 from PyQt5.QtCore import QBuffer, QObject, QRect, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import (
-    QColor,
-    QCursor,
-    QIcon,
-    QMouseEvent,
-    QPainter,
-    QPainterPath,
-    QPaintEvent,
-    QPixmap,
-)
+from PyQt5.QtGui import QColor, QCursor, QIcon, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPaintEvent, QPixmap
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
+    QCheckBox,
     QDialog,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMenu,
     QPushButton,
     QSystemTrayIcon,
@@ -53,26 +48,258 @@ default_settings = {
         "persistent_window_hotkey": "<ctrl>+<alt>+W",
         "persistent_screenshot_hotkey": "<ctrl>+<alt>+E",
     },
+    "enable_global_hotkeys": False,
     "ocr_settings": {"grayscale": False},
 }
 
-global_config_dict = {}
+global_config_dict: dict[str, Any] = {}
+
+key_dict = {
+    Qt.Key_0: "0",
+    Qt.Key_1: "1",
+    Qt.Key_2: "2",
+    Qt.Key_3: "3",
+    Qt.Key_4: "4",
+    Qt.Key_5: "5",
+    Qt.Key_6: "6",
+    Qt.Key_7: "7",
+    Qt.Key_8: "8",
+    Qt.Key_9: "9",
+    Qt.Key_Escape: "ESCAPE",
+    Qt.Key_Backspace: "BACKSPACE",
+    Qt.Key_Return: "RETURN",
+    Qt.Key_Enter: "ENTER",
+    Qt.Key_Insert: "INS",
+    Qt.Key_Delete: "DEL",
+    Qt.Key_Pause: "PAUSE",
+    Qt.Key_Print: "PRINT",
+    Qt.Key_Home: "HOME",
+    Qt.Key_End: "END",
+    Qt.Key_Left: "LEFT",
+    Qt.Key_Up: "UP",
+    Qt.Key_Right: "RIGHT",
+    Qt.Key_Down: "DOWN",
+    Qt.Key_PageUp: "PGUP",
+    Qt.Key_PageDown: "PGDOWN",
+    Qt.Key_Comma: ",",
+    Qt.Key_Underscore: "_",
+    Qt.Key_Minus: "-",
+    Qt.Key_Period: ".",
+    Qt.Key_Slash: "/",
+    Qt.Key_Colon: ":",
+    Qt.Key_Semicolon: ";",
+    Qt.Key_F1: "F1",
+    Qt.Key_F2: "F2",
+    Qt.Key_F3: "F3",
+    Qt.Key_F4: "F4",
+    Qt.Key_F5: "F5",
+    Qt.Key_F6: "F6",
+    Qt.Key_F7: "F7",
+    Qt.Key_F8: "F8",
+    Qt.Key_F9: "F9",
+    Qt.Key_F10: "F10",
+    Qt.Key_F11: "F11",
+    Qt.Key_F12: "F12",
+    Qt.Key_A: "A",
+    Qt.Key_B: "B",
+    Qt.Key_C: "C",
+    Qt.Key_D: "D",
+    Qt.Key_E: "E",
+    Qt.Key_F: "F",
+    Qt.Key_G: "G",
+    Qt.Key_H: "H",
+    Qt.Key_I: "I",
+    Qt.Key_J: "J",
+    Qt.Key_K: "K",
+    Qt.Key_L: "L",
+    Qt.Key_M: "M",
+    Qt.Key_N: "N",
+    Qt.Key_O: "O",
+    Qt.Key_P: "P",
+    Qt.Key_Q: "Q",
+    Qt.Key_R: "R",
+    Qt.Key_S: "S",
+    Qt.Key_T: "T",
+    Qt.Key_U: "U",
+    Qt.Key_V: "V",
+    Qt.Key_W: "W",
+    Qt.Key_X: "X",
+    Qt.Key_Y: "Y",
+    Qt.Key_Z: "Z",
+}
 
 
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Migaku OCR")
+        self.setWindowFlags(Qt.Dialog)
+
+        def add_main_window_buttons():
+            selection_ocr_button = QPushButton("Selection OCR")
+            selection_ocr_button.clicked.connect(take_single_screenshot)
+
+            show_persistent_window_button = QPushButton("Show Persistent Window")
+            show_persistent_window_button.clicked.connect(show_persistent_screenshot_window)
+
+            persistent_window_ocr_button = QPushButton("Persistent Window OCR")
+            persistent_window_ocr_button.setIcon(QIcon("ocr_icon.png"))
+            persistent_window_ocr_button.clicked.connect(take_screenshot_from_persistent_window)
+
+            hotkey_config_button = QPushButton("Configure Hotkeys")
+            hotkey_config_button.clicked.connect(show_hotkey_config)
+
+            layout = QVBoxLayout()
+            layout.addWidget(selection_ocr_button)
+            layout.addWidget(show_persistent_window_button)
+            layout.addWidget(persistent_window_ocr_button)
+            layout.addWidget(hotkey_config_button)
+            self.setLayout(layout)
+
+        add_main_window_buttons()
+
+
+def show_hotkey_config():
+    global hotkey_window
+    hotkey_window = HotKeySettingsWindow()
+    hotkey_window.show()
+
+
+class HotKeySettingsWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        global main_hotkey_qobject
+        try:
+            main_hotkey_qobject.manager.hotkey.stop()
+        except AttributeError:
+            pass
+
+        self.original_config = copy.deepcopy(global_config_dict)
+
+        self.setWindowTitle("Migaku OCR Hotkey Settings")
+        self.setWindowFlags(Qt.Dialog)
+        layout = QVBoxLayout()
+
+        self.hotkeyCheckBox = QCheckBox("Enable Global Hotkeys")
+        self.hotkeyCheckBox.setChecked(global_config_dict["enable_global_hotkeys"])
+        self.hotkeyCheckBox.stateChanged.connect(self.checkboxToggl)
+
+        layout.addWidget(self.hotkeyCheckBox)
+        singleScreenshotHotkeyField = HotKeyField("single_screenshot_hotkey", "Single screenshot OCR")
+        layout.addWidget(singleScreenshotHotkeyField)
+        persistentWindowHotkeyField = HotKeyField("persistent_window_hotkey", "Spawn persistent window")
+        layout.addWidget(persistentWindowHotkeyField)
+        persistentScreenshotHotkeyField = HotKeyField("persistent_screenshot_hotkey", "Persistent window OCR")
+        layout.addWidget(persistentScreenshotHotkeyField)
+
+        buttonLayout = QHBoxLayout()
+        layout.addLayout(buttonLayout)
+        self.okButton = QPushButton("OK")
+        self.okButton.clicked.connect(self.saveClose)
+        buttonLayout.addWidget(self.okButton)
+        self.cancelButton = QPushButton("Cancel")
+        self.cancelButton.clicked.connect(self.cancelClose)
+        buttonLayout.addWidget(self.cancelButton)
+        self.setLayout(layout)
+
+    def checkboxToggl(self, state):
+        global_config_dict["enable_global_hotkeys"] = True if state == Qt.Checked else False
+
+    def saveClose(self):
+        save_config()
+        self.close()
+
+    def cancelClose(self):
+        global global_config_dict
+        global_config_dict = self.original_config
+        self.close()
+
+    def closeEvent(self, *args, **kwargs):
+        super().closeEvent(*args, **kwargs)
+
+        global main_hotkey_qobject
+        main_hotkey_qobject = MainHotkeyQObject()
+
+
+class HotKeyField(QWidget):
+    def __init__(self, hotkey_functionality: str, hotkey_name: str):
+        super().__init__()
+        hotkey_label = QLabel(hotkey_name)
+        layout = QHBoxLayout()
+        layout.addWidget(hotkey_label)
+
+        self.keyEdit = KeySequenceLineEdit(hotkey_functionality)
+        layout.addWidget(self.keyEdit)
+
+        self.clearButton = QPushButton("Clear")
+        self.clearButton.clicked.connect(self.keyEdit.clear)
+        layout.addWidget(self.clearButton)
+
+        self.setLayout(layout)
+
+
+class KeySequenceLineEdit(QLineEdit):
+    def __init__(self, hotkey_functionality: str):
+        super().__init__()
+        self.modifiers: Qt.KeyboardModifiers = Qt.NoModifier
+        self.key: Qt.Key = Qt.Key_unknown
+        self.keysequence = QKeySequence()
+        self.hotkey_functionality = hotkey_functionality
+        self.setText(self.getQtText(global_config_dict["hotkeys"][self.hotkey_functionality]))
+
+    def clear(self):
+        self.setText("")
+        global_config_dict["hotkeys"][self.hotkey_functionality] = ""
+
+    def keyPressEvent(self, event):
+        super().keyPressEvent(event)
+        self.modifiers = event.modifiers()
+        self.key = event.key()
+        self.updateKeySequence()
+        self.updateConfig()
+
+    def updateConfig(self):
+        global_config_dict["hotkeys"][self.hotkey_functionality] = self.getPynputText()
+
+    def updateKeySequence(self):
+        self.keysequence = (
+            QKeySequence(self.modifiers) if self.key not in key_dict else QKeySequence(self.modifiers | self.key)
+        )
+        self.updateText()
+
+    def updateText(self):
+        self.setText(self.keysequence.toString())
+
+    def getPynputText(self):
+        def upper_repl(match):
+            return match.group(1).upper()
+
+        qt_string: str = self.keysequence.toString()
+        tmp = qt_string.lower()
+        tmp = re.sub(r"shift\+(\w)", upper_repl, tmp)
+        tmp = re.sub(r"(f\d{1,2})", r"<\1>", tmp)
+        tmp = tmp.replace("ctrl", "<ctrl>")
+        tmp = tmp.replace("alt", "<alt>")
+        tmp = tmp.replace("meta", "<cmd>")
+        return tmp
+
+    def getQtText(self, pynputText):
+        tmp = re.sub(r"([A-Z])", lambda match: "Shift+" + match.group(1).lower(), pynputText)
+        tmp = re.sub(r"<f(\d{1,2})>", r"F\1", tmp)
+        tmp = re.sub(r"([a-z])$", lambda match: match.group(1).upper(), tmp)
+        tmp = tmp.replace("<ctrl>", "Ctrl")
+        tmp = tmp.replace("<alt>", "Alt")
+        tmp = tmp.replace("<cmd>", "Meta")
+        return tmp
 
 
 class PersistentWindow(QWidget):
-    def __init__(self, x=0, y=0, w=400, h=200, overlay=None):
+    def __init__(self, x=0, y=0, w=400, h=200):
         super().__init__()
         self.setWindowTitle("Migaku OCR")
 
-        self.setWindowFlags(
-            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Dialog
-        )
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Dialog)
 
         self.is_resizing = False
         self.is_moving = False
@@ -93,7 +320,7 @@ class PersistentWindow(QWidget):
         innerWidget.setStyleSheet(
             """
                 QWidget#innerWidget {
-                    border: 2px solid rgba(255, 255, 255, 0.08);
+                    border: 1px solid rgba(255, 255, 255, 0.08);
 
                 }
                 QWidget#innerWidget::hover {
@@ -106,11 +333,11 @@ class PersistentWindow(QWidget):
         middleWidget.setStyleSheet(
             """
                 QWidget#middleWidget {
-                    border: 2px solid rgba(0, 0, 0, 0.3);
+                    border: 1px solid rgba(0, 0, 0, 0.3);
 
                 }
                 QWidget#middleWidget::hover {
-                    border: 2px solid rgb(0, 0, 0);
+                    border: 1px solid rgb(0, 0, 0);
                 }
             """
         )
@@ -140,10 +367,10 @@ class PersistentWindow(QWidget):
         layout.addWidget(middleWidget)
         self.setLayout(layout)
 
-    def mousePressEvent(self, evt):
-        super().mousePressEvent(evt)
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
 
-        if evt.button() == Qt.LeftButton:
+        if event.button() == Qt.LeftButton:
             self.is_moving = True
             cursor_position = QCursor.pos()
             self.original_cursor_x = cursor_position.x()
@@ -153,9 +380,9 @@ class PersistentWindow(QWidget):
             self.original_window_y = window_position.y()
             QApplication.setOverrideCursor(Qt.ClosedHandCursor)
 
-        if evt.button() == Qt.RightButton:
-            self.drag_x = evt.globalX()
-            self.drag_y = evt.globalY()
+        if event.button() == Qt.RightButton:
+            self.drag_x = event.globalX()
+            self.drag_y = event.globalY()
             self.drag_w = self.width()
             self.drag_h = self.height()
             self.is_resizing = True
@@ -168,8 +395,8 @@ class PersistentWindow(QWidget):
         self.ocrButton.hide()
         super().leaveEvent(event)
 
-    def mouseMoveEvent(self, evt):
-        super().mouseMoveEvent(evt)
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
 
         if self.is_moving:
 
@@ -186,23 +413,23 @@ class PersistentWindow(QWidget):
         if self.is_resizing:
 
             def make_size_follow_cursor():
-                w = max(50, self.drag_w + evt.globalX() - self.drag_x)
-                h = max(50, self.drag_h + evt.globalY() - self.drag_y)
+                w = max(50, self.drag_w + event.globalX() - self.drag_x)
+                h = max(50, self.drag_h + event.globalY() - self.drag_y)
                 self.resize(w, h)
                 self.overlay = QPixmap(w, h)
                 self.overlay.fill(Qt.transparent)
 
             make_size_follow_cursor()
 
-    def mouseReleaseEvent(self, evt):
-        super().mouseReleaseEvent(evt)
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
         self.is_moving = False
         self.is_resizing = False
         QApplication.restoreOverrideCursor()
 
-    def keyPressEvent(self, evt):
+    def keyPressEvent(self, event):
 
-        if evt.key() in [Qt.Key_Return, Qt.Key_Enter]:
+        if event.key() in [Qt.Key_Return, Qt.Key_Enter]:
             global closed_persistent_window_x1
             global closed_persistent_window_y1
             global closed_persistent_window_x2
@@ -214,7 +441,7 @@ class PersistentWindow(QWidget):
 
             self.close()
 
-        if evt.key() in [Qt.Key_Escape]:
+        if event.key() in [Qt.Key_Escape]:
             self.close()
 
 
@@ -230,8 +457,8 @@ persistent_window: Optional[PersistentWindow] = None
 @typer_app.command()
 def execute_order66(key_combination: Optional[str] = typer.Argument(None)):
     load_config()
+    global main_hotkey_qobject
     main_hotkey_qobject = MainHotkeyQObject()
-
     # this allows for ctrl-c to close the application
     timer = QTimer()
     timer.start(500)
@@ -244,13 +471,25 @@ def execute_order66(key_combination: Optional[str] = typer.Argument(None)):
     tray.setVisible(True)
     menu = QMenu()
 
+    openMain = QAction("Open Migaku OCR Main Window")
+    openMain.triggered.connect(show_main_window)
     quit = QAction("Quit")
     quit.triggered.connect(app.quit)
+
+    menu.addAction(openMain)
     menu.addAction(quit)
 
     tray.setContextMenu(menu)
 
+    show_main_window()
+
     sys.exit(app.exec_())
+
+
+def show_main_window():
+    global main_window
+    main_window = MainWindow()
+    main_window.show()
 
 
 def load_config():
@@ -281,13 +520,12 @@ class MainHotkeyQObject(QObject):
     def __init__(self):
         super().__init__()
 
-        manager = KeyBoardManager(self)
-        manager.single_screenshot_signal.connect(take_screenshot)
-        manager.persistent_window_signal.connect(show_persistent_screenshot_window)
-        manager.persistent_screenshot_signal.connect(
-            take_screenshot_from_persistent_window
-        )
-        manager.start()
+        if global_config_dict["enable_global_hotkeys"]:
+            self.manager = KeyBoardManager(self)
+            self.manager.single_screenshot_signal.connect(take_single_screenshot)
+            self.manager.persistent_window_signal.connect(show_persistent_screenshot_window)
+            self.manager.persistent_screenshot_signal.connect(take_screenshot_from_persistent_window)
+            self.manager.start()
 
 
 class KeyBoardManager(QObject):
@@ -301,20 +539,14 @@ class KeyBoardManager(QObject):
         # this puts the the user hotkeys into the following format: https://tinyurl.com/vzs2a2rd
         hotkey_dict = {}
         if hotkey_config["single_screenshot_hotkey"]:
-            hotkey_dict[
-                hotkey_config["single_screenshot_hotkey"]
-            ] = self.single_screenshot_signal.emit
+            hotkey_dict[hotkey_config["single_screenshot_hotkey"]] = self.single_screenshot_signal.emit
         if hotkey_config["persistent_window_hotkey"]:
-            hotkey_dict[
-                hotkey_config["persistent_window_hotkey"]
-            ] = self.persistent_window_signal.emit
+            hotkey_dict[hotkey_config["persistent_window_hotkey"]] = self.persistent_window_signal.emit
         if hotkey_config["persistent_screenshot_hotkey"]:
-            hotkey_dict[
-                hotkey_config["persistent_screenshot_hotkey"]
-            ] = self.persistent_screenshot_signal.emit
+            hotkey_dict[hotkey_config["persistent_screenshot_hotkey"]] = self.persistent_screenshot_signal.emit
 
-        hotkey = keyboard.GlobalHotKeys(hotkey_dict)
-        hotkey.start()
+        self.hotkey = keyboard.GlobalHotKeys(hotkey_dict)
+        self.hotkey.start()
 
 
 def take_screenshot_from_persistent_window():
@@ -329,9 +561,7 @@ def take_screenshot_from_persistent_window():
         and not closed_persistent_window_x2
         and not closed_persistent_window_y2
     ):
-        print(
-            "persistent window not initialized yet or persistent_window location not saved"
-        )
+        print("persistent window not initialized yet or persistent_window location not saved")
     else:
         if persistent_window:
             x1 = persistent_window.x()
@@ -365,7 +595,7 @@ def show_persistent_screenshot_window():
     persistent_window.show()
 
 
-def take_screenshot():
+def take_single_screenshot():
     QApplication.setOverrideCursor(Qt.CrossCursor)
     ex = SelectorWidget(app)
     ex.show()
@@ -444,9 +674,7 @@ class SelectorWidget(QDialog):
                 Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.X11BypassWindowManagerHint  # type: ignore
             )
         elif platform.system() == "Windows":
-            self.setWindowFlags(
-                Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool  # type: ignore
-            )
+            self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)  # type: ignore
         elif platform.system() == "Darwin":
             self.setWindowFlags(
                 Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowFullscreenButtonHint  # type: ignore

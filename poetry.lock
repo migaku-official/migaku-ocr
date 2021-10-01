@@ -567,6 +567,14 @@ optional = false
 python-versions = "*"
 
 [[package]]
+name = "types-toml"
+version = "0.1.5"
+description = "Typing stubs for toml"
+category = "main"
+optional = false
+python-versions = "*"
+
+[[package]]
 name = "typing-extensions"
 version = "3.10.0.0"
 description = "Backported and Experimental Type Hints for Python 3.5+"
@@ -620,7 +628,7 @@ six = ">=1.10.0"
 [metadata]
 lock-version = "1.1"
 python-versions = "^3.9"
-content-hash = "6f41c8b66cda65d879d07440c3cb2533a09eb4571de77f45aa759d7ccf2815ca"
+content-hash = "ff37b7aa3d3d9c28579630ec24829441bb119d716fee4c21830cbfb10907a078"
 
 [metadata.files]
 altgraph = [
@@ -954,6 +962,10 @@ typer = [
 types-pillow = [
     {file = "types-Pillow-8.3.2.tar.gz", hash = "sha256:35fa2085164e550ef89d10c75963c5c9d673e8fd529343560b945eb6ac26891d"},
     {file = "types_Pillow-8.3.2-py3-none-any.whl", hash = "sha256:7926e2d0a774184af16115207a4938b3d1089b3cfac658e837af6a6d2ed8cc2d"},
+]
+types-toml = [
+    {file = "types-toml-0.1.5.tar.gz", hash = "sha256:fc5e1df92c245404e4360c63568e9f0e732b0cabea7a220a4788d52b78f5dc59"},
+    {file = "types_toml-0.1.5-py3-none-any.whl", hash = "sha256:dd00526680595aad0eade682bd8a9e9513e9b4b8932daed159925fe446fc90a9"},
 ]
 typing-extensions = [
     {file = "typing_extensions-3.10.0.0-py2-none-any.whl", hash = "sha256:0ac0f89795dd19de6b97debb0c6af1c70987fd80a2d62d1958f7e56fcc31b497"},
