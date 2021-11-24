@@ -6,6 +6,7 @@ import platform
 import re
 import sys
 from concurrent.futures.thread import ThreadPoolExecutor
+from queue import Empty, Queue
 from threading import Thread
 from typing import Any, Optional, cast
 
@@ -18,6 +19,7 @@ import typer
 from appdirs import user_config_dir  # type: ignore
 from notifypy import Notify  # type: ignore
 from PIL import Image, ImageOps
+from PIL.ImageQt import ImageQt
 from pynput import keyboard  # type: ignore
 from PyQt5.QtCore import QBuffer, QObject, QRect, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QCursor, QIcon, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPaintEvent, QPixmap
@@ -37,6 +39,8 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+image_queue: Queue = Queue()
+
 closed_persistent_window_x1 = 0
 closed_persistent_window_y1 = 0
 closed_persistent_window_x2 = 0
@@ -54,7 +58,7 @@ default_settings = {
 
 global_config_dict: dict[str, Any] = {}
 
-key_dict = {
+valid_keys = {
     Qt.Key_0: "0",
     Qt.Key_1: "1",
     Qt.Key_2: "2",
@@ -149,17 +153,68 @@ class MainWindow(QWidget):
             hotkey_config_button = QPushButton("Configure Hotkeys")
             hotkey_config_button.clicked.connect(show_hotkey_config)
 
+            debug_window_button = QPushButton("Show Debug Window")
+            debug_window_button.clicked.connect(show_debug_window)
+
             layout = QVBoxLayout()
             layout.addWidget(selection_ocr_button)
             layout.addWidget(show_persistent_window_button)
             layout.addWidget(persistent_window_ocr_button)
             layout.addWidget(hotkey_config_button)
+            layout.addWidget(debug_window_button)
             self.setLayout(layout)
 
         add_main_window_buttons()
 
 
+def show_debug_window():
+    global debug_window
+    debug_window = DebugWindow()
+    debug_window.show()
+
+
+class DebugWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Migaku OCR Debug Window")
+        self.setWindowFlags(Qt.Dialog)
+        self.setImageAlready = False
+        self.image_label = QLabel()
+
+        layout = QVBoxLayout()
+        debug_image_label = QLabel("This image shows your last screenshot after processing")
+
+        try:
+            image = image_queue.get(block=False)
+            im = ImageQt(image).copy()
+            pixmap = QPixmap.fromImage(im)
+            self.image_label.setPixmap(pixmap)
+            self.setImageAlready = True
+            image_queue.task_done()
+        except Empty:
+            self.image_label.setText("No screenshot taken yet")
+
+        layout.addWidget(debug_image_label)
+        layout.addWidget(self.image_label)
+        self.setLayout(layout)
+        timer = QTimer(self)
+        timer.timeout.connect(self.refresh_image)
+        timer.start(1000)
+
+    def refresh_image(self):
+        try:
+            image = image_queue.get(block=False)
+            im = ImageQt(image).copy()
+            pixmap = QPixmap.fromImage(im)
+            self.image_label.setPixmap(pixmap)
+            self.setImageAlready = True
+            image_queue.task_done()
+        except Empty:
+            pass
+
+
 def show_hotkey_config():
+    # global, so it doesn't get garbage collected
     global hotkey_window
     hotkey_window = HotKeySettingsWindow()
     hotkey_window.show()
@@ -264,7 +319,7 @@ class KeySequenceLineEdit(QLineEdit):
 
     def updateKeySequence(self):
         self.keysequence = (
-            QKeySequence(self.modifiers) if self.key not in key_dict else QKeySequence(self.modifiers | self.key)
+            QKeySequence(self.modifiers) if self.key not in valid_keys else QKeySequence(self.modifiers | self.key)
         )
         self.updateText()
 
@@ -282,6 +337,10 @@ class KeySequenceLineEdit(QLineEdit):
         tmp = tmp.replace("ctrl", "<ctrl>")
         tmp = tmp.replace("alt", "<alt>")
         tmp = tmp.replace("meta", "<cmd>")
+        tmp = tmp.replace("return", "<enter>")
+        tmp = tmp.replace("backspace", "<backspace>")
+        tmp = tmp.replace("pgdown", "page_down")
+        tmp = tmp.replace("pgup", "page_up")
         return tmp
 
     def getQtText(self, pynputText):
@@ -471,7 +530,7 @@ def execute_order66(key_combination: Optional[str] = typer.Argument(None)):
     tray.setVisible(True)
     menu = QMenu()
 
-    openMain = QAction("Open Migaku OCR Main Window")
+    openMain = QAction("Open")
     openMain.triggered.connect(show_main_window)
     quit = QAction("Quit")
     quit.triggered.connect(app.quit)
@@ -616,7 +675,7 @@ def start_ocr(image: Image.Image):
 def process_image(image: Image.Image):
     if global_config_dict["ocr_settings"]["grayscale"]:
         image = ImageOps.grayscale(image)
-    image.save("debug.png")
+    image_queue.put(image)
     width, height = image.size
     language = ""
     if platform.system() == "Windows":
