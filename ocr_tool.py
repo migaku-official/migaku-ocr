@@ -12,7 +12,7 @@ from typing import Any, Optional, cast
 
 import pykakasi
 import pyperclip  # type: ignore
-import pyscreenshot as ImageGrab
+import pyscreenshot as ImageGrab  # type: ignore
 import pytesseract  # type: ignore
 import toml
 import typer
@@ -41,10 +41,18 @@ from PyQt5.QtWidgets import (
 
 image_queue: Queue = Queue()
 
-closed_persistent_window_x1 = 0
-closed_persistent_window_y1 = 0
-closed_persistent_window_x2 = 0
-closed_persistent_window_y2 = 0
+
+class Rectangle:
+    def __init__(self, x1=0, y1=0, x2=0, y2=0):
+        self.x1 = x1
+        self.y1 = y1
+        self.x2 = x2
+        self.y2 = y2
+
+
+closed_persistent_window = Rectangle()
+
+srs_image_location = Rectangle()
 
 default_settings = {
     "hotkeys": {
@@ -53,6 +61,7 @@ default_settings = {
         "persistent_screenshot_hotkey": "<ctrl>+<alt>+E",
     },
     "enable_global_hotkeys": False,
+    "enable_srs_image": True,
     "ocr_settings": {"grayscale": False},
 }
 
@@ -153,6 +162,9 @@ class MainWindow(QWidget):
             hotkey_config_button = QPushButton("Configure Hotkeys")
             hotkey_config_button.clicked.connect(show_hotkey_config)
 
+            srs_image_location_button = QPushButton("Set Screenshot location for SRS image")
+            srs_image_location_button.clicked.connect(set_srs_image_location)
+
             debug_window_button = QPushButton("Show Debug Window")
             debug_window_button.clicked.connect(show_debug_window)
 
@@ -161,10 +173,53 @@ class MainWindow(QWidget):
             layout.addWidget(show_persistent_window_button)
             layout.addWidget(persistent_window_ocr_button)
             layout.addWidget(hotkey_config_button)
+            layout.addWidget(srs_image_location_button)
             layout.addWidget(debug_window_button)
             self.setLayout(layout)
 
         add_main_window_buttons()
+
+
+def set_srs_image_location():
+    global srs_image_location
+    QApplication.setOverrideCursor(Qt.CrossCursor)
+    selection_window = SelectorWidget(app)
+    selection_window.show()
+    selection_window.activateWindow()
+    if selection_window.exec() == QDialog.Accepted:
+        if selection_window.coordinates:
+            srs_image_location.x1 = selection_window.coordinates.x1
+            srs_image_location.y1 = selection_window.coordinates.y1
+            srs_image_location.x2 = selection_window.coordinates.x2
+            srs_image_location.y2 = selection_window.coordinates.y2
+    QApplication.restoreOverrideCursor()
+
+
+def take_srs_screenshot():
+    if not global_config_dict["enable_srs_image"]:
+        # exit function if srs_image is disabled
+        return
+    global srs_image_location
+    if (
+        not srs_image_location.x1
+        and not srs_image_location.y1
+        and not srs_image_location.x2
+        and not srs_image_location.y2
+    ):
+        screen = QApplication.primaryScreen()
+        size = screen.size()
+        srs_image_location.x2 = size.width()
+        srs_image_location.y2 = size.height()
+
+    image = ImageGrab.grab(
+        bbox=(srs_image_location.x1, srs_image_location.y1, srs_image_location.x2, srs_image_location.y2)
+    )
+    image.save("test.png")
+
+
+def take_srs_screenshot_in_thread():
+    process = Thread(target=take_srs_screenshot)
+    process.start()
 
 
 def show_debug_window():
@@ -489,14 +544,11 @@ class PersistentWindow(QWidget):
     def keyPressEvent(self, event):
 
         if event.key() in [Qt.Key_Return, Qt.Key_Enter]:
-            global closed_persistent_window_x1
-            global closed_persistent_window_y1
-            global closed_persistent_window_x2
-            global closed_persistent_window_y2
-            closed_persistent_window_x1 = self.x()
-            closed_persistent_window_y1 = self.y()
-            closed_persistent_window_x2 = closed_persistent_window_x1 + self.width()
-            closed_persistent_window_y2 = closed_persistent_window_y1 + self.height()
+            global closed_persistent_window
+            closed_persistent_window.x1 = self.x()
+            closed_persistent_window.y1 = self.y()
+            closed_persistent_window.x2 = closed_persistent_window.x1 + self.width()
+            closed_persistent_window.y2 = closed_persistent_window.y1 + self.height()
 
             self.close()
 
@@ -609,16 +661,14 @@ class KeyBoardManager(QObject):
 
 
 def take_screenshot_from_persistent_window():
+    take_srs_screenshot_in_thread()
     global persistent_window
-    global closed_persistent_window_x1
-    global closed_persistent_window_y1
-    global closed_persistent_window_x2
-    global closed_persistent_window_y2
+    global closed_persistent_window
     if not persistent_window and (
-        not closed_persistent_window_x1
-        and not closed_persistent_window_y1
-        and not closed_persistent_window_x2
-        and not closed_persistent_window_y2
+        not closed_persistent_window.x1
+        and not closed_persistent_window.y1
+        and not closed_persistent_window.x2
+        and not closed_persistent_window.y2
     ):
         print("persistent window not initialized yet or persistent_window location not saved")
     else:
@@ -628,10 +678,10 @@ def take_screenshot_from_persistent_window():
             x2 = x1 + persistent_window.width()
             y2 = y1 + persistent_window.height()
         else:
-            x1 = closed_persistent_window_x1
-            y1 = closed_persistent_window_y1
-            x2 = closed_persistent_window_x2
-            y2 = closed_persistent_window_y2
+            x1 = closed_persistent_window.x1
+            y1 = closed_persistent_window.y1
+            x2 = closed_persistent_window.x2
+            y2 = closed_persistent_window.y2
         image = ImageGrab.grab(bbox=(x1, y1, x2, y2))
         if persistent_window and persistent_window.ocrButton.isVisible():
             button = persistent_window.ocrButton
@@ -655,6 +705,7 @@ def show_persistent_screenshot_window():
 
 
 def take_single_screenshot():
+    take_srs_screenshot_in_thread()
     QApplication.setOverrideCursor(Qt.CrossCursor)
     ex = SelectorWidget(app)
     ex.show()
@@ -748,12 +799,16 @@ class SelectorWidget(QDialog):
         self.selectedRect = QRect()
         self.selectedPixmap = None
 
+        self.coordinates = Rectangle()
+
     def keyPressEvent(self, event):
         if event.key() in [Qt.Key_Escape]:
             self.reject()
 
     def mousePressEvent(self, event: QMouseEvent):
         self.selectedRect.setTopLeft(event.globalPos())
+        self.coordinates.x1 = event.globalX()
+        self.coordinates.y1 = event.globalY()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         self.selectedRect.setBottomRight(event.globalPos())
@@ -761,6 +816,8 @@ class SelectorWidget(QDialog):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         self.selectedPixmap = self.desktopPixmap.copy(self.selectedRect.normalized())
+        self.coordinates.x2 = event.globalX()
+        self.coordinates.y2 = event.globalY()
         self.accept()
 
     def paintEvent(self, event: QPaintEvent) -> None:
