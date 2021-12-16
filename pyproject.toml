@@ -5,8 +5,8 @@ description = ""
 authors = ["Julius Dehner <julius.dehner@gmail.com>"]
 
 [tool.poetry.dependencies]
-python = "^3.9"
-PyQt5 = "^5.15.4"
+python = "3.10"
+PyQt5 = "^5.15.6"
 pyscreenshot = "^3.0"
 Pillow = "^8.3.1"
 numpy = "^1.21.1"
@@ -23,14 +23,28 @@ xlib = "^0.21"
 playsound = "^1.3.0"
 toml = "^0.10.2"
 appdirs = "^1.4.4"
-types-toml = "^0.1.5"
+SoundCard = "^0.4.1"
+scipy = "^1.7.3"
 
 [tool.poetry.dev-dependencies]
 PyQt5-stubs = "^5.15.2"
 mypy = "^0.910"
-flake8 = "^3.9.2"
 types-Pillow = "^8.3.1"
 pyinstaller = "^4.5.1"
+flake8 = "*"
+types-toml = "*"
+flake8-bugbear = "*"
+flake8-builtins = "*"
+flake8-logging-format = "*"
+tox = "*"
+pytest = "*"
+flake8-executable = "*"
+flake8-pytest-style = "*"
+flake8-simplify = "*"
+flake8-comprehensions = "*"
+flake8-pie = "*"
+flake8-mypy = "^17.8.0"
+
 
 [tool.black]
 line-length = 120

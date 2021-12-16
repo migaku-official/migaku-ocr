@@ -1,30 +1,39 @@
 import copy
+import time
 import io
 import os
 import pathlib
 import platform
 import re
 import sys
+from collections import deque
 from concurrent.futures.thread import ThreadPoolExecutor
 from queue import Empty, Queue
+from shutil import which
+from tempfile import NamedTemporaryFile
 from threading import Thread
 from typing import Any, Optional, cast
 
-import pykakasi
+import numpy  # type: ignore
+import pykakasi  # type: ignore
 import pyperclip  # type: ignore
 import pyscreenshot as ImageGrab  # type: ignore
 import pytesseract  # type: ignore
+import soundcard  # type: ignore
 import toml
-import typer
-from appdirs import user_config_dir  # type: ignore
+import typer  # type: ignore
+from appdirs import user_config_dir
+from easyprocess import EasyProcess
 from notifypy import Notify  # type: ignore
 from PIL import Image, ImageOps
 from PIL.ImageQt import ImageQt
 from pynput import keyboard  # type: ignore
 from PyQt5.QtCore import QBuffer, QObject, QRect, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QCursor, QIcon, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPaintEvent, QPixmap
+from PyQt5.QtGui import QColor, QCursor, QIcon, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPixmap, QPaintEvent
 from PyQt5.QtWidgets import (
     QAction,
+    QComboBox,
+    QSpinBox,
     QApplication,
     QCheckBox,
     QDialog,
@@ -38,8 +47,37 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from scipy.io import wavfile  # type: ignore
+
+ffmpeg_command: Optional[str] = ""
+
+
+def resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
+
+
+if os.path.isfile(resource_path("./ffmpeg")):
+    ffmpeg_command = resource_path("./ffmpeg")
+if platform.system() == "Windows":
+    ffmpeg_command = "ffmpeg.exe"
+
+
+if not ffmpeg_command:
+    ffmpeg_command = which("ffmpeg")
+
+missing_program = ""
+if not ffmpeg_command:
+    missing_program = "ffmpeg"
+
 
 image_queue: Queue = Queue()
+
+signal_to_stop_recording: Queue = Queue()
+audio_data_queue: Queue = Queue()
+
+selected_mic = None
 
 
 class Rectangle:
@@ -59,8 +97,11 @@ default_settings = {
         "single_screenshot_hotkey": "<ctrl>+<alt>+Q",
         "persistent_window_hotkey": "<ctrl>+<alt>+W",
         "persistent_screenshot_hotkey": "<ctrl>+<alt>+E",
+        "stop_recording_hotkey": "<ctrl>+<alt>+S",
     },
     "enable_global_hotkeys": False,
+    "enable_recording": False,
+    "recording_seconds": 5,
     "enable_srs_image": True,
     "ocr_settings": {"grayscale": False},
 }
@@ -148,36 +189,70 @@ class MainWindow(QWidget):
         self.setWindowTitle("Migaku OCR")
         self.setWindowFlags(Qt.Dialog)
 
-        def add_main_window_buttons():
-            selection_ocr_button = QPushButton("Selection OCR")
-            selection_ocr_button.clicked.connect(take_single_screenshot)
+        selection_ocr_button = QPushButton("Selection OCR")
+        selection_ocr_button.clicked.connect(take_single_screenshot)
 
-            show_persistent_window_button = QPushButton("Show Persistent Window")
-            show_persistent_window_button.clicked.connect(show_persistent_screenshot_window)
+        show_persistent_window_button = QPushButton("Show Persistent Window")
+        show_persistent_window_button.clicked.connect(show_persistent_screenshot_window)
 
-            persistent_window_ocr_button = QPushButton("Persistent Window OCR")
-            persistent_window_ocr_button.setIcon(QIcon("ocr_icon.png"))
-            persistent_window_ocr_button.clicked.connect(take_screenshot_from_persistent_window)
+        persistent_window_ocr_button = QPushButton("Persistent Window OCR")
+        persistent_window_ocr_button.setIcon(QIcon("ocr_icon.png"))
+        persistent_window_ocr_button.clicked.connect(take_screenshot_from_persistent_window)
 
-            hotkey_config_button = QPushButton("Configure Hotkeys")
-            hotkey_config_button.clicked.connect(show_hotkey_config)
+        hotkey_config_button = QPushButton("Configure Hotkeys")
+        hotkey_config_button.clicked.connect(show_hotkey_config)
 
-            srs_image_location_button = QPushButton("Set Screenshot location for SRS image")
-            srs_image_location_button.clicked.connect(set_srs_image_location)
+        srs_image_location_button = QPushButton("Set Screenshot location for SRS image")
+        srs_image_location_button.clicked.connect(set_srs_image_location)
 
-            debug_window_button = QPushButton("Show Debug Window")
-            debug_window_button.clicked.connect(show_debug_window)
+        debug_window_button = QPushButton("Show Debug Window")
+        debug_window_button.clicked.connect(show_debug_window)
 
-            layout = QVBoxLayout()
-            layout.addWidget(selection_ocr_button)
-            layout.addWidget(show_persistent_window_button)
-            layout.addWidget(persistent_window_ocr_button)
-            layout.addWidget(hotkey_config_button)
-            layout.addWidget(srs_image_location_button)
-            layout.addWidget(debug_window_button)
-            self.setLayout(layout)
+        self.recording_checkbox = QCheckBox("Enable Recording")
+        self.recording_checkbox.setChecked(global_config_dict["enable_recording"])
+        self.recording_checkbox.stateChanged.connect(self.checkboxToggl)
 
-        add_main_window_buttons()
+        self.recording_seconds_spinbox = QSpinBox()
+        self.recording_seconds_spinbox.setValue(global_config_dict["recording_seconds"])
+        self.recording_seconds_spinbox.setMinimum(1)
+        self.recording_seconds_spinbox.valueChanged.connect(self.spinbox_valuechange)
+
+        self.mics = soundcard.all_microphones(include_loopback=True)
+        mic_names = [mic.name for mic in self.mics]
+        self.mic_combobox = QComboBox()
+        self.mic_combobox.addItems(mic_names)
+        loopback = get_loopback_device(self.mics)
+        if loopback:
+            self.mic_combobox.setCurrentText(loopback.name)
+        global selected_mic
+        selected_mic = next(x for x in self.mics if x.name == self.mic_combobox.currentText())
+
+        save_settings_button = QPushButton("Save Settings")
+        save_settings_button.clicked.connect(save_config)
+
+        layout = QVBoxLayout()
+        layout.addWidget(selection_ocr_button)
+        layout.addWidget(show_persistent_window_button)
+        layout.addWidget(persistent_window_ocr_button)
+        layout.addWidget(hotkey_config_button)
+        layout.addWidget(srs_image_location_button)
+        layout.addWidget(debug_window_button)
+        layout.addWidget(self.recording_checkbox)
+        layout.addWidget(self.recording_seconds_spinbox)
+        layout.addWidget(self.mic_combobox)
+        layout.addWidget(save_settings_button)
+        self.setLayout(layout)
+
+    def checkboxToggl(self, state):
+        global_config_dict["enable_recording"] = True if state == Qt.Checked else False
+
+    def spinbox_valuechange(self):
+        global_config_dict["recording_seconds"] = self.recording_seconds_spinbox.value()
+
+    def mic_selection_change(self):
+        global selected_mic
+        mic_name = self.mic_combobox.currentText()
+        selected_mic = next(x for x in self.mics if x.name == mic_name)
 
 
 def set_srs_image_location():
@@ -214,7 +289,8 @@ def take_srs_screenshot():
     image = ImageGrab.grab(
         bbox=(srs_image_location.x1, srs_image_location.y1, srs_image_location.x2, srs_image_location.y2)
     )
-    image.save("test.png")
+    if image:
+        image.save("test.png")
 
 
 def take_srs_screenshot_in_thread():
@@ -302,6 +378,8 @@ class HotKeySettingsWindow(QWidget):
         layout.addWidget(persistentWindowHotkeyField)
         persistentScreenshotHotkeyField = HotKeyField("persistent_screenshot_hotkey", "Persistent window OCR")
         layout.addWidget(persistentScreenshotHotkeyField)
+        stopRecordingHotkeyField = HotKeyField("stop_recording_hotkey", "Stop recording")
+        layout.addWidget(stopRecordingHotkeyField)
 
         buttonLayout = QHBoxLayout()
         layout.addLayout(buttonLayout)
@@ -352,7 +430,7 @@ class HotKeyField(QWidget):
 class KeySequenceLineEdit(QLineEdit):
     def __init__(self, hotkey_functionality: str):
         super().__init__()
-        self.modifiers: Qt.KeyboardModifiers = Qt.NoModifier
+        self.modifiers: Qt.KeyboardModifiers = Qt.NoModifier  # type: ignore
         self.key: Qt.Key = Qt.Key_unknown
         self.keysequence = QKeySequence()
         self.hotkey_functionality = hotkey_functionality
@@ -373,9 +451,10 @@ class KeySequenceLineEdit(QLineEdit):
         global_config_dict["hotkeys"][self.hotkey_functionality] = self.getPynputText()
 
     def updateKeySequence(self):
-        self.keysequence = (
-            QKeySequence(self.modifiers) if self.key not in valid_keys else QKeySequence(self.modifiers | self.key)
-        )
+        if self.key not in valid_keys:
+            self.keysequence = QKeySequence(self.modifiers)
+        else:
+            self.keysequence = QKeySequence(self.modifiers | self.key)  # type: ignore
         self.updateText()
 
     def updateText(self):
@@ -413,7 +492,7 @@ class PersistentWindow(QWidget):
         super().__init__()
         self.setWindowTitle("Migaku OCR")
 
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Dialog)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Dialog)  # type: ignore
 
         self.is_resizing = False
         self.is_moving = False
@@ -433,12 +512,12 @@ class PersistentWindow(QWidget):
         innerWidget.setObjectName("innerWidget")
         innerWidget.setStyleSheet(
             """
-                QWidget#innerWidget {
-                    border: 1px solid rgba(255, 255, 255, 0.08);
+            QWidget#innerWidget {
+                border: 1px solid rgba(255, 255, 255, 0.08);
 
                 }
-                QWidget#innerWidget::hover {
-                    border: 1px solid rgb(255, 255, 255);
+            QWidget#innerWidget::hover {
+                border: 1px solid rgb(255, 255, 255);
                 }
             """
         )
@@ -446,12 +525,12 @@ class PersistentWindow(QWidget):
         middleWidget.setObjectName("middleWidget")
         middleWidget.setStyleSheet(
             """
-                QWidget#middleWidget {
-                    border: 1px solid rgba(0, 0, 0, 0.3);
+            QWidget#middleWidget {
+                border: 1px solid rgba(0, 0, 0, 0.3);
 
                 }
-                QWidget#middleWidget::hover {
-                    border: 1px solid rgb(0, 0, 0);
+            QWidget#middleWidget::hover {
+                border: 1px solid rgb(0, 0, 0);
                 }
             """
         )
@@ -464,9 +543,9 @@ class PersistentWindow(QWidget):
         ocrButton.clicked.connect(take_screenshot_from_persistent_window)
         ocrButton.setStyleSheet(
             """
-                QPushButton {
-                    background-color: white;
-                    padding: 0px;
+            QPushButton {
+                background-color: white;
+                padding: 0px;
                 }
             """
         )
@@ -476,7 +555,7 @@ class PersistentWindow(QWidget):
         ocrButton.hide()
 
         middleLayout.addWidget(innerWidget)
-        innerLayout.addWidget(ocrButton, alignment=Qt.AlignRight | Qt.AlignBottom)
+        innerLayout.addWidget(ocrButton, alignment=Qt.AlignRight | Qt.AlignBottom)  # type: ignore
         innerWidget.setLayout(innerLayout)
         layout.addWidget(middleWidget)
         self.setLayout(layout)
@@ -530,8 +609,8 @@ class PersistentWindow(QWidget):
                 w = max(50, self.drag_w + event.globalX() - self.drag_x)
                 h = max(50, self.drag_h + event.globalY() - self.drag_y)
                 self.resize(w, h)
-                self.overlay = QPixmap(w, h)
-                self.overlay.fill(Qt.transparent)
+                # self.overlay = QPixmap(w, h)
+                # self.overlay.fill(Qt.transparent)
 
             make_size_follow_cursor()
 
@@ -566,7 +645,7 @@ persistent_window: Optional[PersistentWindow] = None
 
 
 @typer_app.command()
-def execute_order66(key_combination: Optional[str] = typer.Argument(None)):
+def execute_order66():
     load_config()
     global main_hotkey_qobject
     main_hotkey_qobject = MainHotkeyQObject()
@@ -636,6 +715,7 @@ class MainHotkeyQObject(QObject):
             self.manager.single_screenshot_signal.connect(take_single_screenshot)
             self.manager.persistent_window_signal.connect(show_persistent_screenshot_window)
             self.manager.persistent_screenshot_signal.connect(take_screenshot_from_persistent_window)
+            self.manager.stop_recording_signal.connect(stop_recording)
             self.manager.start()
 
 
@@ -643,6 +723,7 @@ class KeyBoardManager(QObject):
     single_screenshot_signal = pyqtSignal()
     persistent_window_signal = pyqtSignal()
     persistent_screenshot_signal = pyqtSignal()
+    stop_recording_signal = pyqtSignal()
 
     def start(self):
         global global_config_dict
@@ -655,6 +736,8 @@ class KeyBoardManager(QObject):
             hotkey_dict[hotkey_config["persistent_window_hotkey"]] = self.persistent_window_signal.emit
         if hotkey_config["persistent_screenshot_hotkey"]:
             hotkey_dict[hotkey_config["persistent_screenshot_hotkey"]] = self.persistent_screenshot_signal.emit
+        if hotkey_config["stop_recording_hotkey"]:
+            hotkey_dict[hotkey_config["stop_recording_hotkey"]] = self.stop_recording_signal.emit
 
         self.hotkey = keyboard.GlobalHotKeys(hotkey_dict)
         self.hotkey.start()
@@ -683,7 +766,7 @@ def take_screenshot_from_persistent_window():
             x2 = closed_persistent_window.x2
             y2 = closed_persistent_window.y2
         image = ImageGrab.grab(bbox=(x1, y1, x2, y2))
-        if persistent_window and persistent_window.ocrButton.isVisible():
+        if image and persistent_window and persistent_window.ocrButton.isVisible():
             button = persistent_window.ocrButton
             x1 = button.x()
             y1 = button.y()
@@ -781,7 +864,10 @@ class SelectorWidget(QDialog):
         super(SelectorWidget, self).__init__()
         if platform.system() == "Linux":
             self.setWindowFlags(
-                Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.X11BypassWindowManagerHint  # type: ignore
+                Qt.FramelessWindowHint
+                | Qt.WindowStaysOnTopHint
+                | Qt.Tool
+                | Qt.X11BypassWindowManagerHint  # type: ignore
             )
         elif platform.system() == "Windows":
             self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)  # type: ignore
@@ -820,7 +906,7 @@ class SelectorWidget(QDialog):
         self.coordinates.y2 = event.globalY()
         self.accept()
 
-    def paintEvent(self, event: QPaintEvent) -> None:
+    def paintEvent(self, _: QPaintEvent) -> None:
         painter = QPainter(self)
         painter.drawPixmap(0, 0, self.desktopPixmap)
         path = QPainterPath()
@@ -834,7 +920,7 @@ def convert_qpixmap_to_pil_image(pixmap: QPixmap):
     buffer = QBuffer()
     buffer.open(QBuffer.ReadWrite)
     q_image.save(buffer, "PNG")
-    return Image.open(io.BytesIO(buffer.data()))
+    return Image.open(io.BytesIO(buffer.data()))  # type: ignore
 
 
 def convert_to_hiragana(text):
@@ -844,6 +930,111 @@ def convert_to_hiragana(text):
     for item in result:
         result_str += item["hira"]
     return result_str
+
+
+def stop_recording():
+    signal_to_stop_recording.put("dummy")
+
+
+def record_audio_in_thread():
+    process = Thread(target=record_audio)
+    process.start()
+
+
+def get_loopback_device(mics):
+    default_speaker = soundcard.default_speaker()
+    loopback = None
+
+    def get_loopback(mics, default_speaker):
+        loopback = None
+        for mic in mics:
+            if mic.isloopback and default_speaker.name in mic.name:
+                loopback = mic
+                break
+        if not loopback:
+            for mic in mics:
+                if default_speaker.name in mic.name:
+                    loopback = mic
+                    break
+        return loopback
+
+    loopback = get_loopback(mics, default_speaker)
+    return loopback
+
+
+def record_audio():
+    samplerate = 48000
+    global selected_mic
+    loopback = selected_mic
+    if not loopback:
+        raise RuntimeError("No loopback device found for default_speaker")
+
+    audio_deque: deque = deque()
+    with loopback.recorder(samplerate=48000) as rec:
+        while True:
+            try:
+                signal_to_stop_recording.get(block=False)
+                signal_to_stop_recording.task_done()
+                break
+            except Empty:
+                data = rec.record(numframes=samplerate)
+                audio_deque.append(data)
+                if len(audio_deque) > global_config_dict["recording_seconds"]:
+                    audio_deque.popleft()
+    global audio_data_queue
+    audio_data_queue.put(audio_deque)
+
+
+def process_audio_in_thread():
+    process = Thread(target=process_audio_data)
+    process.start()
+
+
+def process_audio_data():
+    while True:
+        try:
+            global audio_data_queue
+            audio_deque = audio_data_queue.get(block=False)
+            final_data = audio_deque[0]
+            for count, audio in enumerate(audio_deque):
+                if count == 0:
+                    continue
+                final_data = numpy.append(final_data, audio, axis=0)
+
+            def strip_silent_audio(audio_data):
+                def strip_silent_audio_generic(audio_data):
+                    audio_counter = 0
+                    for audio in audio_data:
+                        is_silent = True
+                        for single_channel_sound in audio:
+                            if single_channel_sound:
+                                is_silent = False
+                        audio_counter += 1
+                        if not is_silent:
+                            break
+                    return audio_counter
+
+                def strip_silent_audio_beginning(audio_data):
+                    audio_counter = strip_silent_audio_generic(audio_data)
+                    return audio_data[audio_counter:]
+
+                def strip_silent_audio_end(audio_data):
+                    audio_counter = strip_silent_audio_generic(reversed(audio_data))
+                    return audio_data[:-audio_counter]
+
+                audio_data = strip_silent_audio_beginning(audio_data)
+                audio_data = strip_silent_audio_end(audio_data)
+                return audio_data
+
+            final_data = strip_silent_audio(final_data)
+
+            with NamedTemporaryFile(suffix=".wav") as temp_wav_file:
+                with NamedTemporaryFile(suffix=".mp3") as temp_mp3_file:
+                    wavfile.write(temp_wav_file, 48000, final_data)
+                    cmd = ["ffmpeg", "-y", "-i", temp_wav_file.name, temp_mp3_file.name]
+                    EasyProcess(cmd).call(timeout=40)
+        except Empty:
+            time.sleep(0.3)
 
 
 if __name__ == "__main__":
