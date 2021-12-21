@@ -1,4 +1,6 @@
 import copy
+import shutil
+
 import time
 import io
 import os
@@ -28,11 +30,23 @@ from notifypy import Notify  # type: ignore
 from PIL import Image, ImageOps
 from PIL.ImageQt import ImageQt
 from pynput import keyboard  # type: ignore
+from loguru import logger
 from PyQt5.QtCore import QBuffer, QObject, QRect, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QCursor, QIcon, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPixmap, QPaintEvent
+from PyQt5.QtGui import (
+    QColor,
+    QCursor,
+    QIcon,
+    QKeySequence,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPixmap,
+    QPaintEvent,
+)
 from PyQt5.QtWidgets import (
     QAction,
     QComboBox,
+    QStyle,
     QSpinBox,
     QApplication,
     QCheckBox,
@@ -79,6 +93,9 @@ audio_data_queue: Queue = Queue()
 
 selected_mic = None
 
+recording_thread: Optional[Thread] = None
+audio_processing_thread: Optional[Thread] = None
+
 
 class Rectangle:
     def __init__(self, x1=0, y1=0, x2=0, y2=0):
@@ -101,7 +118,7 @@ default_settings = {
     },
     "enable_global_hotkeys": False,
     "enable_recording": False,
-    "recording_seconds": 5,
+    "recording_seconds": 20,
     "enable_srs_image": True,
     "ocr_settings": {"grayscale": False},
 }
@@ -212,10 +229,31 @@ class MainWindow(QWidget):
         self.recording_checkbox.setChecked(global_config_dict["enable_recording"])
         self.recording_checkbox.stateChanged.connect(self.checkboxToggl)
 
+        save_icon = QApplication.style().standardIcon(QStyle.SP_DialogSaveButton)
+
+        audio_save_button = QPushButton("Save Recording and send to Browser Extension")
+        audio_save_button.setIcon(save_icon)
+        audio_save_button.clicked.connect(save_audio_and_restart_recording)
+
+        recording_layout = QHBoxLayout()
+        recording_layout.setContentsMargins(0, 0, 0, 0)
+        recording_layout.addWidget(self.recording_checkbox)
+        recording_layout.addWidget(audio_save_button)
+        recording_widget = QWidget()
+        recording_widget.setLayout(recording_layout)
+
+        recording_seconds_label = QLabel("Seconds to continuously record:")
         self.recording_seconds_spinbox = QSpinBox()
         self.recording_seconds_spinbox.setValue(global_config_dict["recording_seconds"])
         self.recording_seconds_spinbox.setMinimum(1)
         self.recording_seconds_spinbox.valueChanged.connect(self.spinbox_valuechange)
+
+        recording_seconds_layout = QHBoxLayout()
+        recording_seconds_layout.setContentsMargins(0, 0, 0, 0)
+        recording_seconds_layout.addWidget(recording_seconds_label)
+        recording_seconds_layout.addWidget(self.recording_seconds_spinbox)
+        recording_seconds_widget = QWidget()
+        recording_seconds_widget.setLayout(recording_seconds_layout)
 
         self.mics = soundcard.all_microphones(include_loopback=True)
         mic_names = [mic.name for mic in self.mics]
@@ -226,6 +264,8 @@ class MainWindow(QWidget):
             self.mic_combobox.setCurrentText(loopback.name)
         global selected_mic
         selected_mic = next(x for x in self.mics if x.name == self.mic_combobox.currentText())
+        if global_config_dict["enable_recording"]:
+            save_audio_and_restart_recording()
 
         save_settings_button = QPushButton("Save Settings")
         save_settings_button.clicked.connect(save_config)
@@ -237,14 +277,18 @@ class MainWindow(QWidget):
         layout.addWidget(hotkey_config_button)
         layout.addWidget(srs_image_location_button)
         layout.addWidget(debug_window_button)
-        layout.addWidget(self.recording_checkbox)
-        layout.addWidget(self.recording_seconds_spinbox)
+        layout.addWidget(recording_widget)
+        layout.addWidget(recording_seconds_widget)
         layout.addWidget(self.mic_combobox)
         layout.addWidget(save_settings_button)
         self.setLayout(layout)
 
     def checkboxToggl(self, state):
         global_config_dict["enable_recording"] = True if state == Qt.Checked else False
+        if state == Qt.Checked:
+            save_audio_and_restart_recording()
+        else:
+            stop_recording()
 
     def spinbox_valuechange(self):
         global_config_dict["recording_seconds"] = self.recording_seconds_spinbox.value()
@@ -694,7 +738,7 @@ def load_config():
         # merge default config and user config, user config has precedence; python3.9+ only
         global_config_dict = global_config_dict | toml.loads(config_text)
     except FileNotFoundError:
-        print("no config file exists, loading default values")
+        logger.info("no config file exists, loading default values")
 
 
 def save_config():
@@ -753,7 +797,7 @@ def take_screenshot_from_persistent_window():
         and not closed_persistent_window.x2
         and not closed_persistent_window.y2
     ):
-        print("persistent window not initialized yet or persistent_window location not saved")
+        logger.warning("persistent window not initialized yet or persistent_window location not saved")
     else:
         if persistent_window:
             x1 = persistent_window.x()
@@ -827,7 +871,7 @@ def process_image(image: Image.Image):
 
     for (f, t) in [(" ", ""), ("いぃ", "い"), ("\n", "")]:
         text = text.replace(f, t)
-    print(text)
+    logger.info(text)
     return text
 
 
@@ -932,13 +976,32 @@ def convert_to_hiragana(text):
     return result_str
 
 
+def save_audio_and_restart_recording():
+    stop_recording()
+    _record_audio_in_thread()
+
+
 def stop_recording():
+    global signal_to_stop_recording
+    global recording_thread
     signal_to_stop_recording.put("dummy")
+    if recording_thread and recording_thread.is_alive():
+        recording_thread.join(timeout=1)
 
 
-def record_audio_in_thread():
-    process = Thread(target=record_audio)
-    process.start()
+def _record_audio_in_thread():
+    global signal_to_stop_recording
+    global recording_thread
+    global audio_processing_thread
+    with signal_to_stop_recording.mutex:
+        signal_to_stop_recording.queue.clear()
+    if not audio_processing_thread:
+        _process_audio_in_thread()
+    elif audio_processing_thread and not audio_processing_thread.is_alive():
+        _process_audio_in_thread()
+
+    recording_thread = Thread(target=_record_audio)
+    recording_thread.start()
 
 
 def get_loopback_device(mics):
@@ -962,7 +1025,8 @@ def get_loopback_device(mics):
     return loopback
 
 
-def record_audio():
+def _record_audio():
+    logger.debug("Starting audio recording")
     samplerate = 48000
     global selected_mic
     loopback = selected_mic
@@ -970,6 +1034,7 @@ def record_audio():
         raise RuntimeError("No loopback device found for default_speaker")
 
     audio_deque: deque = deque()
+    logger.debug(f"selected mic: {loopback}")
     with loopback.recorder(samplerate=48000) as rec:
         while True:
             try:
@@ -985,16 +1050,19 @@ def record_audio():
     audio_data_queue.put(audio_deque)
 
 
-def process_audio_in_thread():
-    process = Thread(target=process_audio_data)
-    process.start()
+def _process_audio_in_thread():
+    global audio_processing_thread
+    audio_processing_thread = Thread(target=_process_audio_data)
+    audio_processing_thread.start()
 
 
-def process_audio_data():
+def _process_audio_data():
+    logger.debug("Starting audio processing")
     while True:
         try:
             global audio_data_queue
             audio_deque = audio_data_queue.get(block=False)
+            logger.debug("Got audio processing data")
             final_data = audio_deque[0]
             for count, audio in enumerate(audio_deque):
                 if count == 0:
@@ -1028,11 +1096,18 @@ def process_audio_data():
 
             final_data = strip_silent_audio(final_data)
 
-            with NamedTemporaryFile(suffix=".wav") as temp_wav_file:
-                with NamedTemporaryFile(suffix=".mp3") as temp_mp3_file:
-                    wavfile.write(temp_wav_file, 48000, final_data)
-                    cmd = ["ffmpeg", "-y", "-i", temp_wav_file.name, temp_mp3_file.name]
-                    EasyProcess(cmd).call(timeout=40)
+            logger.info(final_data)
+
+            if final_data.size > 0:
+                logger.info("Converting audio")
+                with NamedTemporaryFile(suffix=".wav") as temp_wav_file:
+                    with NamedTemporaryFile(suffix=".mp3") as temp_mp3_file:
+                        wavfile.write(temp_wav_file, 48000, final_data)
+                        cmd = ["ffmpeg", "-y", "-i", temp_wav_file.name, temp_mp3_file.name]
+                        EasyProcess(cmd).call(timeout=40)
+                        # uncomment below for testing
+                        shutil.copyfile(temp_mp3_file.name, "test.mp3")
+
         except Empty:
             time.sleep(0.3)
 
