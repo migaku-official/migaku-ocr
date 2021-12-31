@@ -1,62 +1,54 @@
-import copy
-import shutil
+from __future__ import annotations
 
-import time
+
+import copy
 import io
 import os
 import pathlib
 import platform
 import re
+import shutil
+import math
 import sys
 from collections import deque
 from concurrent.futures.thread import ThreadPoolExecutor
-from queue import Empty, Queue
 from shutil import which
 from tempfile import NamedTemporaryFile
-from threading import Thread
 from typing import Any, Optional, cast
 
-import numpy  # type: ignore
-import pykakasi  # type: ignore
+import numpy
+import pykakasi
 import pyperclip  # type: ignore
 import pyscreenshot as ImageGrab  # type: ignore
 import pytesseract  # type: ignore
 import soundcard  # type: ignore
-import toml
-import typer  # type: ignore
+import tomli
+import tomli_w
+import typer
 from appdirs import user_config_dir
-from easyprocess import EasyProcess
+from easyprocess import EasyProcess  # type: ignore
+from loguru import logger
 from notifypy import Notify  # type: ignore
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 from PIL.ImageQt import ImageQt
 from pynput import keyboard  # type: ignore
-from loguru import logger
-from PyQt5.QtCore import QBuffer, QObject, QRect, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import (
-    QColor,
-    QCursor,
-    QIcon,
-    QKeySequence,
-    QMouseEvent,
-    QPainter,
-    QPainterPath,
-    QPixmap,
-    QPaintEvent,
-)
+from PyQt5.QtCore import QBuffer, QObject, QRect, Qt, QThread, QTimer, pyqtBoundSignal, pyqtSignal
+from PyQt5.QtGui import QColor, QCursor, QIcon, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPaintEvent, QPixmap
 from PyQt5.QtWidgets import (
     QAction,
-    QComboBox,
-    QStyle,
-    QSpinBox,
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMenu,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QStyle,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -86,15 +78,14 @@ if not ffmpeg_command:
     missing_program = "ffmpeg"
 
 
-image_queue: Queue = Queue()
-
-signal_to_stop_recording: Queue = Queue()
-audio_data_queue: Queue = Queue()
+unprocessed_image: Optional[Image.Image] = None
+processed_image: Optional[Image.Image] = None
 
 selected_mic = None
 
-recording_thread: Optional[Thread] = None
-audio_processing_thread: Optional[Thread] = None
+ocr_thread: Optional[QThread] = None
+srs_screenshot_thread: Optional[QThread] = None
+ocr_settings_window = None
 
 
 class Rectangle:
@@ -107,23 +98,71 @@ class Rectangle:
 
 closed_persistent_window = Rectangle()
 
-srs_image_location = Rectangle()
 
-default_settings = {
-    "hotkeys": {
-        "single_screenshot_hotkey": "<ctrl>+<alt>+Q",
-        "persistent_window_hotkey": "<ctrl>+<alt>+W",
-        "persistent_screenshot_hotkey": "<ctrl>+<alt>+E",
-        "stop_recording_hotkey": "<ctrl>+<alt>+S",
-    },
-    "enable_global_hotkeys": False,
-    "enable_recording": False,
-    "recording_seconds": 20,
-    "enable_srs_image": True,
-    "ocr_settings": {"grayscale": False},
-}
+class Configuration:
+    def __init__(self) -> None:
+        default_settings = {
+            "hotkeys": {
+                "single_screenshot_hotkey": "<ctrl>+<alt>+Q",
+                "persistent_window_hotkey": "<ctrl>+<alt>+W",
+                "persistent_screenshot_hotkey": "<ctrl>+<alt>+E",
+                "stop_recording_hotkey": "<ctrl>+<alt>+S",
+            },
+            "enable_global_hotkeys": False,
+            "texthooker_mode": False,
+            "enable_recording": False,
+            "recording_seconds": 20,
+            "enable_srs_image": True,
+            "ocr_settings": {
+                "grayscale": True,
+                "upscale_amount": 2,
+                "edge_enhance": True,
+            },
+        }
+        self.config_dict: dict[str, Any]
+        self.config_dict = self.load_config(default_settings)
 
-global_config_dict: dict[str, Any] = {}
+    def load_config(self, default_settings) -> dict[str, Any]:
+        config_dir = user_config_dir("migaku-ocr")
+        pathlib.Path(config_dir).mkdir(parents=True, exist_ok=True)
+        config_file = os.path.join(config_dir, "config.toml")
+        global_config_dict = default_settings
+        try:
+            with open(config_file, "r") as f:
+                config_text = f.read()
+
+            # from: https://stackoverflow.com/a/7205107
+            def merge(a, b, path=None):
+                "merges b into a"
+                if path is None:
+                    path = []
+                for key in b:
+                    if key in a:
+                        if isinstance(a[key], dict) and isinstance(b[key], dict):
+                            merge(a[key], b[key], path + [str(key)])
+                        elif a[key] == b[key]:
+                            pass  # same leaf value
+                        else:
+                            # a should win in case of conflict
+                            pass
+                    else:
+                        a[key] = b[key]
+                return a
+
+            # merge default config and user config, user config has precedence
+            global_config_dict = cast(dict, merge(tomli.loads(config_text), global_config_dict))
+            logger.debug(global_config_dict)
+        except FileNotFoundError:
+            logger.info("no config file exists, loading default values")
+        return global_config_dict
+
+    def save_config(self):
+        config_dir = user_config_dir("migaku-ocr")
+        pathlib.Path(config_dir).mkdir(parents=True, exist_ok=True)
+        config_file = os.path.join(config_dir, "config.toml")
+        with open(config_file, "wb") as f:
+            tomli_w.dump(self.config_dict, f)
+
 
 valid_keys = {
     Qt.Key_0: "0",
@@ -201,39 +240,77 @@ valid_keys = {
 
 
 class MainWindow(QWidget):
-    def __init__(self):
+    def __init__(
+        self,
+        config: Configuration,
+        master_object: MasterObject,
+        srs_screenshot: SRSScreenshot,
+        audio_worker: AudioWorker,
+        main_hotkey_qobject: MainHotkeyQObject,
+    ):
         super().__init__()
         self.setWindowTitle("Migaku OCR")
         self.setWindowFlags(Qt.Dialog)
+        self.config = config
+        self.srs_screenshot = srs_screenshot
+        self.audio_worker = audio_worker
+        self.main_hotkey_qobject = main_hotkey_qobject
 
         selection_ocr_button = QPushButton("Selection OCR")
-        selection_ocr_button.clicked.connect(take_single_screenshot)
+        selection_ocr_button.clicked.connect(master_object.take_single_screenshot)
 
         show_persistent_window_button = QPushButton("Show Persistent Window")
-        show_persistent_window_button.clicked.connect(show_persistent_screenshot_window)
+        show_persistent_window_button.clicked.connect(master_object.show_persistent_screenshot_window)
 
         persistent_window_ocr_button = QPushButton("Persistent Window OCR")
         persistent_window_ocr_button.setIcon(QIcon("ocr_icon.png"))
-        persistent_window_ocr_button.clicked.connect(take_screenshot_from_persistent_window)
+        persistent_window_ocr_button.clicked.connect(master_object.take_screenshot_from_persistent_window)
 
         hotkey_config_button = QPushButton("Configure Hotkeys")
-        hotkey_config_button.clicked.connect(show_hotkey_config)
+        hotkey_config_button.clicked.connect(self.show_hotkey_config)
+
+        srs_screenshot_widget = QWidget()
+        srs_screenshot_layout = QHBoxLayout()
+        srs_screenshot_layout.setContentsMargins(0, 0, 0, 0)
+        srs_screenshot_widget.setLayout(srs_screenshot_layout)
+
+        srs_screenshot_checkbox = QCheckBox("SRS Screenshot 🛈")
+        srs_screenshot_checkbox.setChecked(config.config_dict["enable_srs_image"])
+        srs_screenshot_checkbox.setToolTip("A screenshot will be taken that can be added to your SRS cards")
+
+        def srs_screenshot_checkbox_toggl(state):
+            self.config.config_dict["enable_srs_image"] = True if state == Qt.Checked else False
+
+        srs_screenshot_checkbox.stateChanged.connect(srs_screenshot_checkbox_toggl)
+        self.texthooker_mode_checkbox = QCheckBox("Texthooker mode 🛈")
+        self.texthooker_mode_checkbox.setChecked(config.config_dict["texthooker_mode"])
+
+        def texthooker_mode_checkbox_toggl(state):
+            self.config.config_dict["texthooker_mode"] = True if state == Qt.Checked else False
+            if state == Qt.Checked:
+                self.srs_screenshot.start_texthooker_mode()
+
+        self.texthooker_mode_checkbox.stateChanged.connect(texthooker_mode_checkbox_toggl)
+        self.texthooker_mode_checkbox.setToolTip("Screenshot is taken automatically on clipboard change")
+
+        srs_screenshot_layout.addWidget(srs_screenshot_checkbox)
+        srs_screenshot_layout.addWidget(self.texthooker_mode_checkbox)
 
         srs_image_location_button = QPushButton("Set Screenshot location for SRS image")
-        srs_image_location_button.clicked.connect(set_srs_image_location)
+        srs_image_location_button.clicked.connect(srs_screenshot.set_srs_image_location)
 
-        debug_window_button = QPushButton("Show Debug Window")
-        debug_window_button.clicked.connect(show_debug_window)
+        ocr_settings_button = QPushButton("Show OCR Settings")
+        ocr_settings_button.clicked.connect(show_ocr_settings_window)
 
         self.recording_checkbox = QCheckBox("Enable Recording")
-        self.recording_checkbox.setChecked(global_config_dict["enable_recording"])
-        self.recording_checkbox.stateChanged.connect(self.checkboxToggl)
+        self.recording_checkbox.setChecked(config.config_dict["enable_recording"])
+        self.recording_checkbox.stateChanged.connect(self.recording_checkbox_toggl)
 
         save_icon = QApplication.style().standardIcon(QStyle.SP_DialogSaveButton)
 
         audio_save_button = QPushButton("Save Recording and send to Browser Extension")
         audio_save_button.setIcon(save_icon)
-        audio_save_button.clicked.connect(save_audio_and_restart_recording)
+        audio_save_button.clicked.connect(audio_worker.save_audio_and_restart_recording)
 
         recording_layout = QHBoxLayout()
         recording_layout.setContentsMargins(0, 0, 0, 0)
@@ -244,7 +321,7 @@ class MainWindow(QWidget):
 
         recording_seconds_label = QLabel("Seconds to continuously record:")
         self.recording_seconds_spinbox = QSpinBox()
-        self.recording_seconds_spinbox.setValue(global_config_dict["recording_seconds"])
+        self.recording_seconds_spinbox.setValue(config.config_dict["recording_seconds"])
         self.recording_seconds_spinbox.setMinimum(1)
         self.recording_seconds_spinbox.valueChanged.connect(self.spinbox_valuechange)
 
@@ -264,146 +341,288 @@ class MainWindow(QWidget):
             self.mic_combobox.setCurrentText(loopback.name)
         global selected_mic
         selected_mic = next(x for x in self.mics if x.name == self.mic_combobox.currentText())
-        if global_config_dict["enable_recording"]:
-            save_audio_and_restart_recording()
+        self.mic_combobox.activated[str].connect(self.mic_selection_change)
+
+        if config.config_dict["enable_recording"]:
+            self.audio_worker.save_audio_and_restart_recording()
+
+        self.audio_peak_progressbar = QProgressBar()
+        self.audio_peak_progressbar.setTextVisible(False)
+        progressbar_style = """
+        min-height: 10px;
+        max-height: 10px;
+        """
+        self.audio_peak_progressbar.setStyleSheet(progressbar_style)
+        self.update_audio_progressbar_in_thread()
 
         save_settings_button = QPushButton("Save Settings")
-        save_settings_button.clicked.connect(save_config)
+        save_settings_button.clicked.connect(config.save_config)
 
         layout = QVBoxLayout()
         layout.addWidget(selection_ocr_button)
         layout.addWidget(show_persistent_window_button)
         layout.addWidget(persistent_window_ocr_button)
+        layout.addWidget(ocr_settings_button)
         layout.addWidget(hotkey_config_button)
+        layout.addWidget(srs_screenshot_widget)
         layout.addWidget(srs_image_location_button)
-        layout.addWidget(debug_window_button)
         layout.addWidget(recording_widget)
         layout.addWidget(recording_seconds_widget)
         layout.addWidget(self.mic_combobox)
+        layout.addWidget(self.audio_peak_progressbar)
         layout.addWidget(save_settings_button)
         self.setLayout(layout)
 
-    def checkboxToggl(self, state):
-        global_config_dict["enable_recording"] = True if state == Qt.Checked else False
+    def show_hotkey_config(self):
+        # global, so it doesn't get garbage collected
+        self.hotkey_window = HotKeySettingsWindow(self.config, self.main_hotkey_qobject)
+        self.hotkey_window.show()
+
+    def update_audio_progressbar_in_thread(self):
+        self.update_audio_progress_thread = MainWindow.UpdateAudioProgressThread()
+        self.update_audio_progress_thread.volume_signal.connect(self.update_volume_progressbar)
+        self.update_audio_progress_thread.start()
+
+    def update_volume_progressbar(self, volume: int):
+        self.audio_peak_progressbar.setValue(volume)
+
+    def recording_checkbox_toggl(self, state):
+        self.config.config_dict["enable_recording"] = True if state == Qt.Checked else False
         if state == Qt.Checked:
-            save_audio_and_restart_recording()
+            self.audio_worker.save_audio_and_restart_recording()
         else:
-            stop_recording()
+            self.audio_worker.stop_recording()
 
     def spinbox_valuechange(self):
-        global_config_dict["recording_seconds"] = self.recording_seconds_spinbox.value()
+        self.config.config_dict["recording_seconds"] = self.recording_seconds_spinbox.value()
 
     def mic_selection_change(self):
         global selected_mic
         mic_name = self.mic_combobox.currentText()
         selected_mic = next(x for x in self.mics if x.name == mic_name)
+        self.update_audio_progress_thread.stop()
+        self.update_audio_progress_thread.wait(1)
+        self.update_audio_progressbar_in_thread()
+
+    class UpdateAudioProgressThread(QThread):
+        volume_signal = pyqtSignal([int])
+
+        def __init__(self):
+            QThread.__init__(self)
+            self.stop_signal = False
+
+        def run(self):
+            samplerate = 48000
+            global selected_mic
+            loopback = selected_mic
+            if not loopback:
+                raise RuntimeError("No audio device set")
+            with loopback.recorder(samplerate=samplerate) as rec:
+                while not self.stop_signal:
+                    data: numpy.ndarray
+                    data = rec.record()
+                    added_data = [abs(sum(instance)) for instance in data]
+                    volume = int(math.ceil(numpy.mean(added_data) * 100))
+                    self.volume_signal.emit(volume)
+
+        def stop(self):
+            self.stop_signal = True
 
 
-def set_srs_image_location():
-    global srs_image_location
-    QApplication.setOverrideCursor(Qt.CrossCursor)
-    selection_window = SelectorWidget(app)
-    selection_window.show()
-    selection_window.activateWindow()
-    if selection_window.exec() == QDialog.Accepted:
-        if selection_window.coordinates:
-            srs_image_location.x1 = selection_window.coordinates.x1
-            srs_image_location.y1 = selection_window.coordinates.y1
-            srs_image_location.x2 = selection_window.coordinates.x2
-            srs_image_location.y2 = selection_window.coordinates.y2
-    QApplication.restoreOverrideCursor()
+class SRSScreenshot:
+    def __init__(self, app, config: Configuration):
+        self.app = app
+        self.config = config
+        self.srs_image_location = Rectangle()
+
+    def set_srs_image_location(self):
+        QApplication.setOverrideCursor(Qt.CrossCursor)
+        selection_window = SelectorWidget(self.app)
+        selection_window.show()
+        selection_window.activateWindow()
+        if selection_window.exec() == QDialog.Accepted:
+            if selection_window.coordinates:
+                self.srs_image_location.x1 = selection_window.coordinates.x1
+                self.srs_image_location.y1 = selection_window.coordinates.y1
+                self.srs_image_location.x2 = selection_window.coordinates.x2
+                self.srs_image_location.y2 = selection_window.coordinates.y2
+        QApplication.restoreOverrideCursor()
+
+    def take_srs_screenshot(self):
+        if not self.config.config_dict["enable_srs_image"]:
+            # exit function if srs_image is disabled
+            return
+        if (
+            not self.srs_image_location.x1
+            and not self.srs_image_location.y1
+            and not self.srs_image_location.x2
+            and not self.srs_image_location.y2
+        ):
+            screen = QApplication.primaryScreen()
+            size = screen.size()
+            self.srs_image_location.x2 = size.width()
+            self.srs_image_location.y2 = size.height()
+
+        image = ImageGrab.grab(
+            bbox=(
+                self.srs_image_location.x1,
+                self.srs_image_location.y1,
+                self.srs_image_location.x2,
+                self.srs_image_location.y2,
+            )
+        )
+        if image:
+            image.save("test.png")
+
+    def trigger_srs_screenshot_on_clipboard_change(self):
+        while True:
+            pyperclip.waitForNewPaste()
+            if not self.config.config_dict["texthooker_mode"]:
+                break
+            self.take_srs_screenshot()
+
+    def take_srs_screenshot_in_thread(self):
+        global srs_screenshot_thread
+        srs_screenshot_thread = SRSScreenshot.SRSScreenshotThread(self, self.config)
+        srs_screenshot_thread.start()
+
+    class SRSScreenshotThread(QThread):
+        def __init__(self, srs_screenshot: SRSScreenshot, config: Configuration):
+            QThread.__init__(self)
+            self.config = config
+            self.srs_screenshot = srs_screenshot
+
+        def run(self):
+            self.srs_screenshot.take_srs_screenshot()
+
+    def start_texthooker_mode(self):
+        self.texthooker_mode_thread = SRSScreenshot.TexthookerModeThread(self, self.config)
+        self.texthooker_mode_thread.start()
+
+    class TexthookerModeThread(QThread):
+        def __init__(self, srs_screenshot: SRSScreenshot, config: Configuration):
+            QThread.__init__(self)
+            self.srs_screenshot = srs_screenshot
+            self.config = config
+
+        def run(self):
+            self.srs_screenshot.trigger_srs_screenshot_on_clipboard_change()
 
 
-def take_srs_screenshot():
-    if not global_config_dict["enable_srs_image"]:
-        # exit function if srs_image is disabled
-        return
-    global srs_image_location
-    if (
-        not srs_image_location.x1
-        and not srs_image_location.y1
-        and not srs_image_location.x2
-        and not srs_image_location.y2
-    ):
-        screen = QApplication.primaryScreen()
-        size = screen.size()
-        srs_image_location.x2 = size.width()
-        srs_image_location.y2 = size.height()
-
-    image = ImageGrab.grab(
-        bbox=(srs_image_location.x1, srs_image_location.y1, srs_image_location.x2, srs_image_location.y2)
-    )
-    if image:
-        image.save("test.png")
+def show_ocr_settings_window():
+    global ocr_settings_window
+    ocr_settings_window = OCRSettingsWindow()
+    ocr_settings_window.show()
 
 
-def take_srs_screenshot_in_thread():
-    process = Thread(target=take_srs_screenshot)
-    process.start()
-
-
-def show_debug_window():
-    global debug_window
-    debug_window = DebugWindow()
-    debug_window.show()
-
-
-class DebugWindow(QWidget):
+class OCRSettingsWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Migaku OCR Debug Window")
+        self.setWindowTitle("Migaku OCR Settings")
         self.setWindowFlags(Qt.Dialog)
-        self.setImageAlready = False
-        self.image_label = QLabel()
+        self.unprocessed_image_label = QLabel()
+        self.processed_image_label = QLabel()
 
-        layout = QVBoxLayout()
-        debug_image_label = QLabel("This image shows your last screenshot after processing")
+        layout = QHBoxLayout()
+        left_side_layout = QVBoxLayout()
+        right_side_layout = QVBoxLayout()
 
-        try:
-            image = image_queue.get(block=False)
-            im = ImageQt(image).copy()
+        global unprocessed_image
+        if unprocessed_image:
+            im = ImageQt(unprocessed_image).copy()
             pixmap = QPixmap.fromImage(im)
-            self.image_label.setPixmap(pixmap)
-            self.setImageAlready = True
-            image_queue.task_done()
-        except Empty:
-            self.image_label.setText("No screenshot taken yet")
+            self.unprocessed_image_label.setPixmap(pixmap)
+        else:
+            self.unprocessed_image_label.setText("No screenshot taken yet...")
 
-        layout.addWidget(debug_image_label)
-        layout.addWidget(self.image_label)
+        global processed_image
+        if processed_image:
+            im = ImageQt(processed_image).copy()
+            pixmap = QPixmap.fromImage(im)
+            self.processed_image_label.setPixmap(pixmap)
+        else:
+            self.processed_image_label.setText("...therefore there's nothing to process.")
+
+        self.ocr_text_label = QLabel("This will show the resulting OCR text.")
+
+        unprocessed_image_layout = QHBoxLayout()
+        unprocessed_image_scrollarea = QScrollArea()
+        unprocessed_image_scrollarea.setLayout(unprocessed_image_layout)
+        unprocessed_image_scrollarea.setWidgetResizable(True)
+        unprocessed_image_layout.addWidget(self.unprocessed_image_label)
+
+        processed_image_layout = QHBoxLayout()
+        processed_image_scrollarea = QScrollArea()
+        processed_image_scrollarea.setLayout(processed_image_layout)
+        processed_image_scrollarea.setWidgetResizable(True)
+        processed_image_layout.addWidget(self.processed_image_label)
+
+        left_side_layout.addWidget(unprocessed_image_scrollarea)
+        left_side_layout.addWidget(processed_image_scrollarea)
+        left_side_layout.addWidget(self.ocr_text_label)
+        left_side_layout.addStretch()
+
+        left_side_widget = QWidget()
+        left_side_widget.setLayout(left_side_layout)
+        layout.addWidget(left_side_widget)
+
+        global global_config_dict
+
+        def change_upscale_value(state):
+            global_config_dict["ocr_settings"]["upscale_amount"] = state
+            start_ocr_in_thread(unprocessed_image)
+
+        def toogle_grayscale(state):
+            global_config_dict["ocr_settings"]["grayscale"] = True if state == Qt.Checked else False
+            start_ocr_in_thread(unprocessed_image)
+
+        def toogle_sharpen(state):
+            global_config_dict["ocr_settings"]["edge_enhance"] = True if state == Qt.Checked else False
+            start_ocr_in_thread(unprocessed_image)
+
+        upscale_spinbox = QSpinBox()
+        upscale_spinbox.setValue(global_config_dict["ocr_settings"]["upscale_amount"])
+        upscale_spinbox.setMinimum(1)
+        upscale_spinbox.setMaximum(6)
+        upscale_spinbox.valueChanged.connect(change_upscale_value)
+        right_side_layout.addWidget(upscale_spinbox)
+
+        grayscaleCheckBox = QCheckBox("Grayscale")
+        grayscaleCheckBox.setChecked(global_config_dict["ocr_settings"]["grayscale"])
+        grayscaleCheckBox.stateChanged.connect(toogle_grayscale)
+        right_side_layout.addWidget(grayscaleCheckBox)
+
+        sharpenCheckBox = QCheckBox("Sharpen Edges")
+        sharpenCheckBox.setChecked(global_config_dict["ocr_settings"]["edge_enhance"])
+        sharpenCheckBox.stateChanged.connect(toogle_sharpen)
+        right_side_layout.addWidget(sharpenCheckBox)
+
+        right_side_widget = QWidget()
+        right_side_widget.setLayout(right_side_layout)
+        layout.addWidget(right_side_widget)
         self.setLayout(layout)
-        timer = QTimer(self)
-        timer.timeout.connect(self.refresh_image)
-        timer.start(1000)
 
-    def refresh_image(self):
-        try:
-            image = image_queue.get(block=False)
-            im = ImageQt(image).copy()
-            pixmap = QPixmap.fromImage(im)
-            self.image_label.setPixmap(pixmap)
-            self.setImageAlready = True
-            image_queue.task_done()
-        except Empty:
-            pass
+    def refresh_unprocessed_image(self, image):
+        im = ImageQt(image).copy()
+        pixmap = QPixmap.fromImage(im)
+        self.unprocessed_image_label.setPixmap(pixmap)
 
+    def refresh_processed_image(self, image):
+        im = ImageQt(image).copy()
+        pixmap = QPixmap.fromImage(im)
+        self.processed_image_label.setPixmap(pixmap)
 
-def show_hotkey_config():
-    # global, so it doesn't get garbage collected
-    global hotkey_window
-    hotkey_window = HotKeySettingsWindow()
-    hotkey_window.show()
+    def refresh_ocr_text(self, text):
+        self.ocr_text_label.setText(text)
 
 
 class HotKeySettingsWindow(QWidget):
-    def __init__(self):
+    def __init__(self, config: Configuration, main_hotkey_qobject):
         super().__init__()
+        self.main_hotkey_qobject = main_hotkey_qobject
+        self.config = config
 
-        global main_hotkey_qobject
-        try:
-            main_hotkey_qobject.manager.hotkey.stop()
-        except AttributeError:
-            pass
+        self.main_hotkey_qobject.stop()
 
         self.original_config = copy.deepcopy(global_config_dict)
 
@@ -439,7 +658,7 @@ class HotKeySettingsWindow(QWidget):
         global_config_dict["enable_global_hotkeys"] = True if state == Qt.Checked else False
 
     def saveClose(self):
-        save_config()
+        self.config.save_config()
         self.close()
 
     def cancelClose(self):
@@ -449,9 +668,7 @@ class HotKeySettingsWindow(QWidget):
 
     def closeEvent(self, *args, **kwargs):
         super().closeEvent(*args, **kwargs)
-
-        global main_hotkey_qobject
-        main_hotkey_qobject = MainHotkeyQObject()
+        self.main_hotkey_qobject.start()
 
 
 class HotKeyField(QWidget):
@@ -532,7 +749,7 @@ class KeySequenceLineEdit(QLineEdit):
 
 
 class PersistentWindow(QWidget):
-    def __init__(self, x=0, y=0, w=400, h=200):
+    def __init__(self, master_object: MasterObject, x=0, y=0, w=400, h=200):
         super().__init__()
         self.setWindowTitle("Migaku OCR")
 
@@ -584,7 +801,7 @@ class PersistentWindow(QWidget):
         innerLayout = QHBoxLayout()
         ocrButton = QPushButton()
         ocrButton.setIcon(QIcon("ocr_icon.png"))
-        ocrButton.clicked.connect(take_screenshot_from_persistent_window)
+        ocrButton.clicked.connect(master_object.take_screenshot_from_persistent_window)
         ocrButton.setStyleSheet(
             """
             QPushButton {
@@ -682,85 +899,130 @@ class PersistentWindow(QWidget):
 typer_app = typer.Typer()
 
 
-app = QApplication(sys.argv)
-app.setQuitOnLastWindowClosed(False)
-
-persistent_window: Optional[PersistentWindow] = None
-
-
 @typer_app.command()
 def execute_order66():
-    load_config()
-    global main_hotkey_qobject
-    main_hotkey_qobject = MainHotkeyQObject()
-    # this allows for ctrl-c to close the application
-    timer = QTimer()
-    timer.start(500)
-    timer.timeout.connect(lambda: None)
-
-    icon = QIcon("migaku_icon.png")
-
-    tray = QSystemTrayIcon()
-    tray.setIcon(icon)
-    tray.setVisible(True)
-    menu = QMenu()
-
-    openMain = QAction("Open")
-    openMain.triggered.connect(show_main_window)
-    quit = QAction("Quit")
-    quit.triggered.connect(app.quit)
-
-    menu.addAction(openMain)
-    menu.addAction(quit)
-
-    tray.setContextMenu(menu)
-
-    show_main_window()
-
-    sys.exit(app.exec_())
+    global master_object
+    master_object = MasterObject()
 
 
-def show_main_window():
-    global main_window
-    main_window = MainWindow()
-    main_window.show()
+class MasterObject:
+    def __init__(self) -> None:
+        self.app = QApplication(sys.argv)
+        self.app.setQuitOnLastWindowClosed(False)
+        self.config = Configuration()
+        global global_config_dict
+        global_config_dict = self.config.config_dict
+        self.srs_screenshot = SRSScreenshot(self.app, self.config)
+        self.audio_worker = AudioWorker()
+        self.main_hotkey_qobject = MainHotkeyQObject(self.config, self, self.audio_worker)
+        # this allows for ctrl-c to close the application
+        timer = QTimer()
+        timer.start(500)
+        timer.timeout.connect(lambda: None)
+        self.setup_tray()
 
+        self.show_main_window()
 
-def load_config():
-    config_dir = user_config_dir("migaku-ocr")
-    pathlib.Path(config_dir).mkdir(parents=True, exist_ok=True)
-    config_file = os.path.join(config_dir, "config.toml")
-    global global_config_dict
-    global_config_dict = default_settings
-    try:
-        with open(config_file, "r") as f:
-            config_text = f.read()
-        # merge default config and user config, user config has precedence; python3.9+ only
-        global_config_dict = global_config_dict | toml.loads(config_text)
-    except FileNotFoundError:
-        logger.info("no config file exists, loading default values")
+        sys.exit(self.app.exec_())
 
+    def setup_tray(self):
+        icon = QIcon("migaku_icon.png")
 
-def save_config():
-    config_dir = user_config_dir("migaku-ocr")
-    pathlib.Path(config_dir).mkdir(parents=True, exist_ok=True)
-    config_file = os.path.join(config_dir, "config.toml")
-    global global_config_dict
-    with open(config_file, "w") as f:
-        toml.dump(global_config_dict, f)
+        self.tray = QSystemTrayIcon()
+        self.tray.setIcon(icon)
+        self.tray.setVisible(True)
+        menu = QMenu()
+
+        openMain = QAction("Open")
+        openMain.triggered.connect(self.show_main_window)
+        quit = QAction("Quit")
+        quit.triggered.connect(self.app.quit)
+
+        menu.addAction(openMain)
+        menu.addAction(quit)
+
+        self.tray.setContextMenu(menu)
+
+    def show_main_window(self):
+        self.main_window = MainWindow(
+            self.config, self, self.srs_screenshot, self.audio_worker, self.main_hotkey_qobject
+        )
+        self.main_window.show()
+
+    def take_single_screenshot(self):
+        self.srs_screenshot.take_srs_screenshot_in_thread()
+        QApplication.setOverrideCursor(Qt.CrossCursor)
+        selector = SelectorWidget(self.app)
+        selector.show()
+        selector.activateWindow()
+        if selector.exec() == QDialog.Accepted:
+            if selector.selectedPixmap:
+                image = convert_qpixmap_to_pil_image(selector.selectedPixmap)
+                start_ocr_in_thread(image)
+        QApplication.restoreOverrideCursor()
+
+    def show_persistent_screenshot_window(self):
+        self.persistent_window = PersistentWindow(self)
+        self.persistent_window.show()
+
+    def take_screenshot_from_persistent_window(self):
+        self.srs_screenshot.take_srs_screenshot_in_thread()
+        persistent_window = self.persistent_window
+        global closed_persistent_window
+        if not persistent_window and (
+            not closed_persistent_window.x1
+            and not closed_persistent_window.y1
+            and not closed_persistent_window.x2
+            and not closed_persistent_window.y2
+        ):
+            logger.warning("persistent window not initialized yet or persistent_window location not saved")
+        else:
+            if persistent_window:
+                x1 = persistent_window.x()
+                y1 = persistent_window.y()
+                x2 = x1 + persistent_window.width()
+                y2 = y1 + persistent_window.height()
+            else:
+                x1 = closed_persistent_window.x1
+                y1 = closed_persistent_window.y1
+                x2 = closed_persistent_window.x2
+                y2 = closed_persistent_window.y2
+            image = ImageGrab.grab(bbox=(x1, y1, x2, y2))
+            if image and persistent_window and persistent_window.ocrButton.isVisible():
+                button = persistent_window.ocrButton
+                x1 = button.x()
+                y1 = button.y()
+                width = button.width()
+                height = button.height()
+                color = image.getpixel((x1 - 1, y1 + height - 2))
+                for x in range(width):
+                    for y in range(height):
+                        image.putpixel((x1 + x, y1 + y), color)
+
+            start_ocr_in_thread(image)
 
 
 class MainHotkeyQObject(QObject):
-    def __init__(self):
+    def __init__(self, config: Configuration, master_object: MasterObject, audio_worker: AudioWorker):
         super().__init__()
 
-        if global_config_dict["enable_global_hotkeys"]:
-            self.manager = KeyBoardManager(self)
-            self.manager.single_screenshot_signal.connect(take_single_screenshot)
-            self.manager.persistent_window_signal.connect(show_persistent_screenshot_window)
-            self.manager.persistent_screenshot_signal.connect(take_screenshot_from_persistent_window)
-            self.manager.stop_recording_signal.connect(stop_recording)
-            self.manager.start()
+        if config.config_dict["enable_global_hotkeys"]:
+            logger.info("Started hotkeys")
+            self.manager = KeyBoardManager(config)
+            self.manager.single_screenshot_signal.connect(master_object.take_single_screenshot)
+            self.manager.persistent_window_signal.connect(master_object.show_persistent_screenshot_window)
+            self.manager.persistent_screenshot_signal.connect(master_object.take_screenshot_from_persistent_window)
+            self.manager.stop_recording_signal.connect(audio_worker.stop_recording)
+            self.start()
+
+    def start(self):
+        self.manager.start()
+
+    def stop(self):
+        try:
+            self.manager.hotkey.stop()
+        except AttributeError:
+            pass
 
 
 class KeyBoardManager(QObject):
@@ -769,9 +1031,13 @@ class KeyBoardManager(QObject):
     persistent_screenshot_signal = pyqtSignal()
     stop_recording_signal = pyqtSignal()
 
+    def __init__(self, config: Configuration):
+        super().__init__()
+        self.config = config
+
     def start(self):
         global global_config_dict
-        hotkey_config = global_config_dict["hotkeys"]
+        hotkey_config = self.config.config_dict["hotkeys"]
         # this puts the the user hotkeys into the following format: https://tinyurl.com/vzs2a2rd
         hotkey_dict = {}
         if hotkey_config["single_screenshot_hotkey"]:
@@ -787,73 +1053,65 @@ class KeyBoardManager(QObject):
         self.hotkey.start()
 
 
-def take_screenshot_from_persistent_window():
-    take_srs_screenshot_in_thread()
-    global persistent_window
-    global closed_persistent_window
-    if not persistent_window and (
-        not closed_persistent_window.x1
-        and not closed_persistent_window.y1
-        and not closed_persistent_window.x2
-        and not closed_persistent_window.y2
-    ):
-        logger.warning("persistent window not initialized yet or persistent_window location not saved")
-    else:
-        if persistent_window:
-            x1 = persistent_window.x()
-            y1 = persistent_window.y()
-            x2 = x1 + persistent_window.width()
-            y2 = y1 + persistent_window.height()
-        else:
-            x1 = closed_persistent_window.x1
-            y1 = closed_persistent_window.y1
-            x2 = closed_persistent_window.x2
-            y2 = closed_persistent_window.y2
-        image = ImageGrab.grab(bbox=(x1, y1, x2, y2))
-        if image and persistent_window and persistent_window.ocrButton.isVisible():
-            button = persistent_window.ocrButton
-            x1 = button.x()
-            y1 = button.y()
-            width = button.width()
-            height = button.height()
-            color = image.getpixel((x1 - 1, y1 + height - 2))
-            for x in range(width):
-                for y in range(height):
-                    image.putpixel((x1 + x, y1 + y), color)
+class OCRThread(QThread):
+    unprocessed_signal = pyqtSignal([Image.Image])
+    processed_signal = pyqtSignal([Image.Image])
+    ocr_text_signal = pyqtSignal([str])
 
-        process = Thread(target=start_ocr, args=(image,))
-        process.start()
+    def __init__(self, image, parent=None):
+        QThread.__init__(self, parent)
+        self.image = image
+
+    def run(self):
+        start_ocr(self.image, self.unprocessed_signal, self.processed_signal, self.ocr_text_signal)
 
 
-def show_persistent_screenshot_window():
-    global persistent_window
-    persistent_window = PersistentWindow()
-    persistent_window.show()
+def start_ocr_in_thread(image):
+    if image:
+        global ocr_thread
+        if ocr_thread:
+            ocr_thread.wait()
+        ocr_thread = OCRThread(image)
+        ocr_thread.start()
+        global ocr_settings_window
+        if ocr_settings_window:
+            ocr_thread.unprocessed_signal.connect(ocr_settings_window.refresh_unprocessed_image)
+            ocr_thread.processed_signal.connect(ocr_settings_window.refresh_processed_image)
+            ocr_thread.ocr_text_signal.connect(ocr_settings_window.refresh_ocr_text)
 
 
-def take_single_screenshot():
-    take_srs_screenshot_in_thread()
-    QApplication.setOverrideCursor(Qt.CrossCursor)
-    ex = SelectorWidget(app)
-    ex.show()
-    ex.activateWindow()
-    if ex.exec() == QDialog.Accepted:
-        if ex.selectedPixmap:
-            image = convert_qpixmap_to_pil_image(ex.selectedPixmap)
-            process = Thread(target=start_ocr, args=(image,))
-            process.start()
-    QApplication.restoreOverrideCursor()
+def start_ocr(
+    image: Image.Image,
+    unprocessed_signal: pyqtBoundSignal,
+    processed_signal: pyqtBoundSignal,
+    ocr_text_signal: pyqtBoundSignal,
+):
+    global unprocessed_image
+    unprocessed_image = image.copy()
+    unprocessed_signal.emit(unprocessed_image)
 
+    image = process_image(image)
 
-def start_ocr(image: Image.Image):
-    text = process_image(image)
+    processed_signal.emit(image)
+    global processed_image
+    processed_image = image
+
+    text = do_ocr(image)
+    ocr_text_signal.emit(text)
     process_text(text)
 
 
 def process_image(image: Image.Image):
+    upscale_amount = global_config_dict["ocr_settings"]["upscale_amount"]
+    image = image.resize((image.width * upscale_amount, image.height * upscale_amount))
     if global_config_dict["ocr_settings"]["grayscale"]:
         image = ImageOps.grayscale(image)
-    image_queue.put(image)
+    if global_config_dict["ocr_settings"]["edge_enhance"]:
+        image = image.filter(ImageFilter.EDGE_ENHANCE)
+    return image
+
+
+def do_ocr(image: Image.Image):
     width, height = image.size
     language = ""
     if platform.system() == "Windows":
@@ -866,7 +1124,6 @@ def process_image(image: Image.Image):
         language = "jpn_vert"
         tesseract_config = "--oem 1 --psm 5"
     text = pytesseract.image_to_string(image, lang=language, config=tesseract_config)
-    text = cast(str, text)
     text = text.strip()
 
     for (f, t) in [(" ", ""), ("いぃ", "い"), ("\n", "")]:
@@ -891,21 +1148,21 @@ def process_text(text: str):
             notification.send(block=False)
 
 
-def grab_screenshot(app: QApplication):
+def capture_desktop(app: QApplication):
     desktop_pixmap = QPixmap(QApplication.desktop().size())
     painter = QPainter(desktop_pixmap)
     for screen in app.screens():
-        painter.drawPixmap(  # type: ignore
+        painter.drawPixmap(
             screen.geometry().topLeft(),
             screen.grabWindow(0),  # type: ignore
         )
+    # painter.end()
     return desktop_pixmap
 
 
 class SelectorWidget(QDialog):
     def __init__(self, app: QApplication):
-        # super(Qt.FramelessWindowHint, self).__init__()
-        super(SelectorWidget, self).__init__()
+        super().__init__()
         if platform.system() == "Linux":
             self.setWindowFlags(
                 Qt.FramelessWindowHint
@@ -921,11 +1178,7 @@ class SelectorWidget(QDialog):
             )
 
         self.setGeometry(QApplication.desktop().geometry())
-        self.desktopPixmap = grab_screenshot(app)
-        label = QLabel()
-        label.setPixmap(self.desktopPixmap)
-        self.grid = QGridLayout()
-        self.grid.addWidget(label, 1, 1)
+        self.desktopPixmap = capture_desktop(app)
         self.selectedRect = QRect()
         self.selectedPixmap = None
 
@@ -957,6 +1210,7 @@ class SelectorWidget(QDialog):
         painter.fillPath(path, QColor.fromRgb(255, 255, 255, 200))
         painter.setPen(Qt.red)
         painter.drawRect(self.selectedRect)
+        # painter.end()
 
 
 def convert_qpixmap_to_pil_image(pixmap: QPixmap):
@@ -976,93 +1230,74 @@ def convert_to_hiragana(text):
     return result_str
 
 
-def save_audio_and_restart_recording():
-    stop_recording()
-    _record_audio_in_thread()
+class AudioWorker:
+    def __init__(self):
+        self.audio_recorder_thread: Optional[AudioWorker.AudioRecorderThread] = None
+        self.audio_processing_thread: Optional[AudioWorker.AudioProcessorThread] = None
 
+    def save_audio_and_restart_recording(self):
+        self.stop_recording()
+        self._start_recording()
 
-def stop_recording():
-    global signal_to_stop_recording
-    global recording_thread
-    signal_to_stop_recording.put("dummy")
-    if recording_thread and recording_thread.is_alive():
-        recording_thread.join(timeout=1)
+    def _start_recording(self):
+        if self.audio_recorder_thread:
+            self.stop_recording()
+        self.audio_recorder_thread = AudioWorker.AudioRecorderThread(self)
+        self.audio_recorder_thread.finished.connect(self._process_audio)
+        self.audio_recorder_thread.start()
 
+    def stop_recording(self) -> None:
+        if self.audio_recorder_thread:
+            self.audio_recorder_thread.stop_recording = True
+            self.audio_recorder_thread.wait(3)
 
-def _record_audio_in_thread():
-    global signal_to_stop_recording
-    global recording_thread
-    global audio_processing_thread
-    with signal_to_stop_recording.mutex:
-        signal_to_stop_recording.queue.clear()
-    if not audio_processing_thread:
-        _process_audio_in_thread()
-    elif audio_processing_thread and not audio_processing_thread.is_alive():
-        _process_audio_in_thread()
+    def _process_audio(self, audio_deque):
+        if self.audio_processing_thread:
+            self.audio_processing_thread.wait(2)
+        self.audio_processing_thread = AudioWorker.AudioProcessorThread(audio_deque)
+        self.audio_processing_thread.start()
 
-    recording_thread = Thread(target=_record_audio)
-    recording_thread.start()
+    class AudioRecorderThread(QThread):
+        finished = pyqtSignal([deque])
 
+        def __init__(self, audio_worker: AudioWorker, parent=None) -> None:
+            QThread.__init__(self, parent)
+            self.stop_recording = False
+            self.audio_worker = audio_worker
 
-def get_loopback_device(mics):
-    default_speaker = soundcard.default_speaker()
-    loopback = None
+        def run(self):
+            self._record_audio()
 
-    def get_loopback(mics, default_speaker):
-        loopback = None
-        for mic in mics:
-            if mic.isloopback and default_speaker.name in mic.name:
-                loopback = mic
-                break
-        if not loopback:
-            for mic in mics:
-                if default_speaker.name in mic.name:
-                    loopback = mic
-                    break
-        return loopback
+        def _record_audio(self) -> None:
+            logger.debug("Starting audio recording")
+            samplerate = 48000
+            global selected_mic
+            loopback = selected_mic
+            if not loopback:
+                raise RuntimeError("No audio device set")
 
-    loopback = get_loopback(mics, default_speaker)
-    return loopback
+            audio_deque: deque = deque()
+            logger.debug(f"selected mic: {loopback}")
+            with loopback.recorder(samplerate=samplerate) as rec:
+                while True:
+                    if self.stop_recording:
+                        break
+                    data = rec.record(numframes=samplerate)
+                    audio_deque.append(data)
+                    if len(audio_deque) > global_config_dict["recording_seconds"]:
+                        audio_deque.popleft()
+            self.finished.emit(audio_deque)
 
+    class AudioProcessorThread(QThread):
+        def __init__(self, audio_deque):
+            QThread.__init__(self)
+            self.audio_deque = audio_deque
 
-def _record_audio():
-    logger.debug("Starting audio recording")
-    samplerate = 48000
-    global selected_mic
-    loopback = selected_mic
-    if not loopback:
-        raise RuntimeError("No loopback device found for default_speaker")
+        def run(self):
+            self._process_audio_data(self.audio_deque)
 
-    audio_deque: deque = deque()
-    logger.debug(f"selected mic: {loopback}")
-    with loopback.recorder(samplerate=48000) as rec:
-        while True:
-            try:
-                signal_to_stop_recording.get(block=False)
-                signal_to_stop_recording.task_done()
-                break
-            except Empty:
-                data = rec.record(numframes=samplerate)
-                audio_deque.append(data)
-                if len(audio_deque) > global_config_dict["recording_seconds"]:
-                    audio_deque.popleft()
-    global audio_data_queue
-    audio_data_queue.put(audio_deque)
-
-
-def _process_audio_in_thread():
-    global audio_processing_thread
-    audio_processing_thread = Thread(target=_process_audio_data)
-    audio_processing_thread.start()
-
-
-def _process_audio_data():
-    logger.debug("Starting audio processing")
-    while True:
-        try:
-            global audio_data_queue
-            audio_deque = audio_data_queue.get(block=False)
-            logger.debug("Got audio processing data")
+        def _process_audio_data(self, audio_deque: deque):
+            logger.info("Processing audio")
             final_data = audio_deque[0]
             for count, audio in enumerate(audio_deque):
                 if count == 0:
@@ -1096,8 +1331,6 @@ def _process_audio_data():
 
             final_data = strip_silent_audio(final_data)
 
-            logger.info(final_data)
-
             if final_data.size > 0:
                 logger.info("Converting audio")
                 with NamedTemporaryFile(suffix=".wav") as temp_wav_file:
@@ -1108,8 +1341,26 @@ def _process_audio_data():
                         # uncomment below for testing
                         shutil.copyfile(temp_mp3_file.name, "test.mp3")
 
-        except Empty:
-            time.sleep(0.3)
+
+def get_loopback_device(mics):
+    default_speaker = soundcard.default_speaker()
+    loopback = None
+
+    def get_loopback(mics, default_speaker):
+        loopback = None
+        for mic in mics:
+            if mic.isloopback and default_speaker.name in mic.name:
+                loopback = mic
+                break
+        if not loopback:
+            for mic in mics:
+                if default_speaker.name in mic.name:
+                    loopback = mic
+                    break
+        return loopback
+
+    loopback = get_loopback(mics, default_speaker)
+    return loopback
 
 
 if __name__ == "__main__":
