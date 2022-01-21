@@ -5,10 +5,8 @@ description = ""
 authors = ["Julius Dehner <julius.dehner@gmail.com>"]
 
 [tool.poetry.dependencies]
-python = ">=3.9,<3.10"
-PyQt5 = "^5.15.6"
+python = ">=3.9,<3.11"
 pyscreenshot = "^3.0"
-Pillow = "^8.3.1"
 numpy = "^1.21.1"
 pytesseract = "^0.3.8"
 pyperclip = "^1.8.2"
@@ -22,15 +20,20 @@ pynput = "^1.7.3"
 xlib = "^0.21"
 playsound = "^1.3.0"
 appdirs = "^1.4.4"
-SoundCard = "^0.4.1"
+SoundCard = { git = "https://github.com/bastibe/SoundCard.git", rev = "8f07897" }
 scipy = "^1.7.3"
 tomli = "^2.0.0"
 tomli-w = "^1.0.0"
+superqt = "^0.2.5"
+opencv-python = "^4.5.5"
+doxapy = "^0.9.1"
+tesserocr = "^2.5.2"
+PySide6 = "^6.2.2"
+Pillow = "^9.0.0"
+ImageHash = "^4.2.1"
 
 [tool.poetry.dev-dependencies]
-PyQt5-stubs = "^5.15.2"
 mypy = "^0.910"
-types-Pillow = "^8.3.1"
 pyinstaller = "^4.5.1"
 flake8 = "*"
 types-toml = "*"
@@ -44,13 +47,21 @@ flake8-pytest-style = "*"
 flake8-simplify = "*"
 flake8-comprehensions = "*"
 flake8-pie = "*"
-flake8-mypy = "^17.8.0"
 black = "*"
 appdirs-stubs = "^0.1.0"
+types-Pillow = "^9.0.0"
+flake8-no-implicit-concat = "^0.3.3"
+flake8-tuple = "^0.4.1"
+flake8-eradicate = "^1.2.0"
+flake8-broken-line = "^0.4.0"
+flake8-bandit = "^2.1.2"
 
 
 [tool.black]
 line-length = 120
+
+# [tool.mypy]
+# mypy_path = ["$MYPY_CONFIG_FILE_DIR/.venv/lib/python3.10/site-packages"]
 
 
 [build-system]

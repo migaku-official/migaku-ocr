@@ -1,5 +1,15 @@
 from __future__ import annotations
+from tesserocr import PyTessBaseAPI, PSM, OEM
 
+import contextlib
+import signal
+
+from typing import Union
+from PIL.PyAccess import PyAccess
+
+
+import cv2  # type: ignore
+import doxapy  # type: ignore
 
 import copy
 import io
@@ -19,7 +29,7 @@ from typing import Any, Optional, cast
 import numpy
 import pykakasi
 import pyperclip  # type: ignore
-import pyscreenshot as ImageGrab  # type: ignore
+import pyscreenshot  # type: ignore
 import pytesseract  # type: ignore
 import soundcard  # type: ignore
 import tomli
@@ -29,13 +39,24 @@ from appdirs import user_config_dir
 from easyprocess import EasyProcess  # type: ignore
 from loguru import logger
 from notifypy import Notify  # type: ignore
-from PIL import Image, ImageFilter, ImageOps
+from superqt import QLabeledSlider
+from PIL import Image, ImageOps
 from PIL.ImageQt import ImageQt
 from pynput import keyboard  # type: ignore
-from PyQt5.QtCore import QBuffer, QObject, QRect, Qt, QThread, QTimer, pyqtBoundSignal, pyqtSignal
-from PyQt5.QtGui import QColor, QCursor, QIcon, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPaintEvent, QPixmap
-from PyQt5.QtWidgets import (
+from PySide6.QtCore import QBuffer, QObject, QRect, Qt, QThread, Signal, SignalInstance
+from PySide6.QtGui import (
     QAction,
+    QColor,
+    QCursor,
+    QIcon,
+    QKeySequence,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPaintEvent,
+    QPixmap,
+)
+from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
@@ -47,6 +68,7 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSlider,
     QSpinBox,
     QStyle,
     QSystemTrayIcon,
@@ -78,25 +100,43 @@ if not ffmpeg_command:
     missing_program = "ffmpeg"
 
 
-unprocessed_image: Optional[Image.Image] = None
-processed_image: Optional[Image.Image] = None
-
 selected_mic = None
-
-ocr_thread: Optional[QThread] = None
-srs_screenshot_thread: Optional[QThread] = None
-ocr_settings_window = None
 
 
 class Rectangle:
-    def __init__(self, x1=0, y1=0, x2=0, y2=0):
+    def __init__(self, x1=0.0, y1=0.0, x2=0.0, y2=0.0):
         self.x1 = x1
         self.y1 = y1
         self.x2 = x2
         self.y2 = y2
 
+    def get_width(self) -> int:
+        return self.x2 - self.x1
 
-closed_persistent_window = Rectangle()
+    def get_height(self) -> int:
+        return self.y2 - self.y1
+
+    def has_been_filled(self):
+        return bool(self.x2 or self.y1 or self.x2 or self.y2)
+
+
+# from: https://stackoverflow.com/a/7205107
+def merge(a, b, path=None):
+    "merges b into a"
+    if path is None:
+        path = []
+    for key in b:
+        if key in a:
+            if isinstance(a[key], dict) and isinstance(b[key], dict):
+                merge(a[key], b[key], path + [str(key)])
+            elif a[key] == b[key]:
+                pass  # same leaf value
+            else:
+                # a should win in case of conflict
+                pass
+        else:
+            a[key] = b[key]
+    return a
 
 
 class Configuration:
@@ -114,9 +154,13 @@ class Configuration:
             "recording_seconds": 20,
             "enable_srs_image": True,
             "ocr_settings": {
-                "grayscale": True,
-                "upscale_amount": 2,
-                "edge_enhance": True,
+                "upscale_amount": 3,
+                "automatic_thresholding": True,
+                "thresholding_value": 130,
+                "thresholding_algorithm": "OTSU",
+                "smart_image_inversion": True,
+                "add_border": True,
+                "character_blacklist": "abcdefghijklmnopqrstuvwxyzüöä",
             },
         }
         self.config_dict: dict[str, Any]
@@ -126,35 +170,17 @@ class Configuration:
         config_dir = user_config_dir("migaku-ocr")
         pathlib.Path(config_dir).mkdir(parents=True, exist_ok=True)
         config_file = os.path.join(config_dir, "config.toml")
-        global_config_dict = default_settings
+        config_dict = default_settings
         try:
             with open(config_file, "r") as f:
                 config_text = f.read()
 
-            # from: https://stackoverflow.com/a/7205107
-            def merge(a, b, path=None):
-                "merges b into a"
-                if path is None:
-                    path = []
-                for key in b:
-                    if key in a:
-                        if isinstance(a[key], dict) and isinstance(b[key], dict):
-                            merge(a[key], b[key], path + [str(key)])
-                        elif a[key] == b[key]:
-                            pass  # same leaf value
-                        else:
-                            # a should win in case of conflict
-                            pass
-                    else:
-                        a[key] = b[key]
-                return a
-
             # merge default config and user config, user config has precedence
-            global_config_dict = cast(dict, merge(tomli.loads(config_text), global_config_dict))
-            logger.debug(global_config_dict)
+            config_dict = cast(dict, merge(tomli.loads(config_text), config_dict))
+            logger.debug(config_dict)
         except FileNotFoundError:
             logger.info("no config file exists, loading default values")
-        return global_config_dict
+        return config_dict
 
     def save_config(self):
         config_dir = user_config_dir("migaku-ocr")
@@ -164,6 +190,19 @@ class Configuration:
             tomli_w.dump(self.config_dict, f)
 
 
+algorithms = {
+    "OTSU": doxapy.Binarization.Algorithms.OTSU,
+    "BERNSEN": doxapy.Binarization.Algorithms.BERNSEN,
+    "NIBLACK": doxapy.Binarization.Algorithms.NIBLACK,
+    "SAUVOLA": doxapy.Binarization.Algorithms.SAUVOLA,
+    "WOLF": doxapy.Binarization.Algorithms.WOLF,
+    "NICK": doxapy.Binarization.Algorithms.NICK,
+    "TRSINGH": doxapy.Binarization.Algorithms.TRSINGH,
+    "BATAINEH": doxapy.Binarization.Algorithms.BATAINEH,
+    "ISAUVOLA": doxapy.Binarization.Algorithms.ISAUVOLA,
+    "WAN": doxapy.Binarization.Algorithms.WAN,
+    "GATOS": doxapy.Binarization.Algorithms.GATOS,
+}
 valid_keys = {
     Qt.Key_0: "0",
     Qt.Key_1: "1",
@@ -250,24 +289,27 @@ class MainWindow(QWidget):
     ):
         super().__init__()
         self.setWindowTitle("Migaku OCR")
-        self.setWindowFlags(Qt.Dialog)
+        self.setWindowFlags(Qt.Dialog)  # type: ignore
         self.config = config
         self.srs_screenshot = srs_screenshot
         self.audio_worker = audio_worker
         self.main_hotkey_qobject = main_hotkey_qobject
+        self.master_object = master_object
+        self.ocr_settings_window: Optional[OCRSettingsWindow] = None
+        processed_image = master_object.processed_image
 
         selection_ocr_button = QPushButton("Selection OCR")
-        selection_ocr_button.clicked.connect(master_object.take_single_screenshot)
+        selection_ocr_button.clicked.connect(master_object.take_single_screenshot)  # type: ignore
 
         show_persistent_window_button = QPushButton("Show Persistent Window")
-        show_persistent_window_button.clicked.connect(master_object.show_persistent_screenshot_window)
+        show_persistent_window_button.clicked.connect(master_object.show_persistent_screenshot_window)  # type: ignore
 
         persistent_window_ocr_button = QPushButton("Persistent Window OCR")
         persistent_window_ocr_button.setIcon(QIcon("ocr_icon.png"))
-        persistent_window_ocr_button.clicked.connect(master_object.take_screenshot_from_persistent_window)
+        persistent_window_ocr_button.clicked.connect(master_object.take_screenshot_from_persistent_window)  # type: ignore
 
         hotkey_config_button = QPushButton("Configure Hotkeys")
-        hotkey_config_button.clicked.connect(self.show_hotkey_config)
+        hotkey_config_button.clicked.connect(self.show_hotkey_config)  # type: ignore
 
         srs_screenshot_widget = QWidget()
         srs_screenshot_layout = QHBoxLayout()
@@ -279,43 +321,80 @@ class MainWindow(QWidget):
         srs_screenshot_checkbox.setToolTip("A screenshot will be taken that can be added to your SRS cards")
 
         def srs_screenshot_checkbox_toggl(state):
-            self.config.config_dict["enable_srs_image"] = True if state == Qt.Checked else False
+            self.config.config_dict["enable_srs_image"] = bool(state == Qt.Checked)
 
-        srs_screenshot_checkbox.stateChanged.connect(srs_screenshot_checkbox_toggl)
+        srs_screenshot_checkbox.stateChanged.connect(srs_screenshot_checkbox_toggl)  # type: ignore
         self.texthooker_mode_checkbox = QCheckBox("Texthooker mode 🛈")
         self.texthooker_mode_checkbox.setChecked(config.config_dict["texthooker_mode"])
 
         def texthooker_mode_checkbox_toggl(state):
-            self.config.config_dict["texthooker_mode"] = True if state == Qt.Checked else False
+            self.config.config_dict["texthooker_mode"] = bool(state == Qt.Checked)
             if state == Qt.Checked:
                 self.srs_screenshot.start_texthooker_mode()
 
-        self.texthooker_mode_checkbox.stateChanged.connect(texthooker_mode_checkbox_toggl)
+        self.texthooker_mode_checkbox.stateChanged.connect(texthooker_mode_checkbox_toggl)  # type: ignore
         self.texthooker_mode_checkbox.setToolTip("Screenshot is taken automatically on clipboard change")
 
         srs_screenshot_layout.addWidget(srs_screenshot_checkbox)
         srs_screenshot_layout.addWidget(self.texthooker_mode_checkbox)
 
         srs_image_location_button = QPushButton("Set Screenshot location for SRS image")
-        srs_image_location_button.clicked.connect(srs_screenshot.set_srs_image_location)
+        srs_image_location_button.clicked.connect(srs_screenshot.set_srs_image_location)  # type: ignore
 
-        ocr_settings_button = QPushButton("Show OCR Settings")
-        ocr_settings_button.clicked.connect(show_ocr_settings_window)
+        ocr_settings_button = QPushButton("OCR Settings")
+        ocr_settings_button.clicked.connect(self.show_ocr_settings_window)  # type: ignore
+
+        def toggle_automatic_thresholding(state):
+            if state == Qt.Checked:
+                self.config.config_dict["ocr_settings"]["automatic_thresholding"] = True
+                self.thresholding_slider.setEnabled(False)
+            else:
+                self.config.config_dict["ocr_settings"]["automatic_thresholding"] = False
+                self.thresholding_slider.setEnabled(True)
+            master_object.ocr.start_ocr_in_thread(master_object.unprocessed_image, skip_override=True)
+
+        self.ocr_text_linedit_current = QLineEdit("This will contain the latest ocr result")
+        self.ocr_text_linedit_last = QLineEdit("This will contain the previous ocr result")
+
+        automatic_thresholding_check_box = QCheckBox("Automatic Thresholding")
+        automatic_thresholding_check_box.setChecked(config.config_dict["ocr_settings"]["automatic_thresholding"])
+        automatic_thresholding_check_box.stateChanged.connect(toggle_automatic_thresholding)  # type: ignore
+
+        self.algorithm_combobox = QComboBox()
+        self.algorithm_combobox.addItems(list(algorithms))
+        self.algorithm_combobox.activated.connect(self.algorithm_change)  # type: ignore
+
+        def change_thresholding_value():
+            self.config.config_dict["ocr_settings"]["thresholding_value"] = self.thresholding_slider.value()
+            print(f"thresholding: {self.thresholding_slider.value()}")
+            print(f"image: {master_object.unprocessed_image}")
+            self.master_object.ocr.start_ocr_in_thread(master_object.unprocessed_image, skip_override=True)
+
+        self.thresholding_slider = QSlider(Qt.Horizontal)
+        self.thresholding_slider.setRange(0, 255)
+        self.thresholding_slider.setPageStep(1)
+        self.thresholding_slider.setValue(config.config_dict["ocr_settings"]["thresholding_value"])
+        self.thresholding_slider.sliderReleased.connect(change_thresholding_value)  # type: ignore
+        self.thresholding_slider.setEnabled(not config.config_dict["ocr_settings"]["automatic_thresholding"])
+
+        processed_image = master_object.processed_image
+        self.image_preview = ImagePreview(processed_image)
 
         self.recording_checkbox = QCheckBox("Enable Recording")
         self.recording_checkbox.setChecked(config.config_dict["enable_recording"])
-        self.recording_checkbox.stateChanged.connect(self.recording_checkbox_toggl)
+        self.recording_checkbox.stateChanged.connect(self.recording_checkbox_toggl)  # type: ignore
 
         save_icon = QApplication.style().standardIcon(QStyle.SP_DialogSaveButton)
 
-        audio_save_button = QPushButton("Save Recording and send to Browser Extension")
-        audio_save_button.setIcon(save_icon)
-        audio_save_button.clicked.connect(audio_worker.save_audio_and_restart_recording)
+        self.audio_save_button = QPushButton("Save Recording and send to Browser Extension")
+        self.audio_save_button.setIcon(save_icon)
+        self.audio_save_button.clicked.connect(audio_worker.save_audio_and_restart_recording)  # type: ignore
+        self.audio_save_button.setEnabled(config.config_dict["enable_recording"])
 
         recording_layout = QHBoxLayout()
         recording_layout.setContentsMargins(0, 0, 0, 0)
         recording_layout.addWidget(self.recording_checkbox)
-        recording_layout.addWidget(audio_save_button)
+        recording_layout.addWidget(self.audio_save_button)
         recording_widget = QWidget()
         recording_widget.setLayout(recording_layout)
 
@@ -323,7 +402,7 @@ class MainWindow(QWidget):
         self.recording_seconds_spinbox = QSpinBox()
         self.recording_seconds_spinbox.setValue(config.config_dict["recording_seconds"])
         self.recording_seconds_spinbox.setMinimum(1)
-        self.recording_seconds_spinbox.valueChanged.connect(self.spinbox_valuechange)
+        self.recording_seconds_spinbox.valueChanged.connect(self.spinbox_valuechange)  # type: ignore
 
         recording_seconds_layout = QHBoxLayout()
         recording_seconds_layout.setContentsMargins(0, 0, 0, 0)
@@ -341,12 +420,13 @@ class MainWindow(QWidget):
             self.mic_combobox.setCurrentText(loopback.name)
         global selected_mic
         selected_mic = next(x for x in self.mics if x.name == self.mic_combobox.currentText())
-        self.mic_combobox.activated[str].connect(self.mic_selection_change)
+        self.mic_combobox.activated.connect(self.mic_selection_change)  # type: ignore
 
         if config.config_dict["enable_recording"]:
             self.audio_worker.save_audio_and_restart_recording()
 
         self.audio_peak_progressbar = QProgressBar()
+        self.audio_peak_progressbar.setRange(0, 1000)
         self.audio_peak_progressbar.setTextVisible(False)
         progressbar_style = """
         min-height: 10px;
@@ -356,13 +436,19 @@ class MainWindow(QWidget):
         self.update_audio_progressbar_in_thread()
 
         save_settings_button = QPushButton("Save Settings")
-        save_settings_button.clicked.connect(config.save_config)
+        save_settings_button.clicked.connect(config.save_config)  # type: ignore
 
         layout = QVBoxLayout()
         layout.addWidget(selection_ocr_button)
         layout.addWidget(show_persistent_window_button)
         layout.addWidget(persistent_window_ocr_button)
         layout.addWidget(ocr_settings_button)
+        layout.addWidget(self.image_preview)
+        layout.addWidget(self.ocr_text_linedit_current)
+        layout.addWidget(self.ocr_text_linedit_last)
+        layout.addWidget(automatic_thresholding_check_box)
+        layout.addWidget(self.algorithm_combobox)
+        layout.addWidget(self.thresholding_slider)
         layout.addWidget(hotkey_config_button)
         layout.addWidget(srs_screenshot_widget)
         layout.addWidget(srs_image_location_button)
@@ -372,6 +458,21 @@ class MainWindow(QWidget):
         layout.addWidget(self.audio_peak_progressbar)
         layout.addWidget(save_settings_button)
         self.setLayout(layout)
+
+    def algorithm_change(self):
+        self.config.config_dict["ocr_settings"]["thresholding_algorithm"] = self.algorithm_combobox.currentText()
+        self.master_object.ocr.start_ocr_in_thread(self.master_object.unprocessed_image, skip_override=True)
+
+    def update_linedit_text(self, text: str):
+        self.ocr_text_linedit_last.setText(self.ocr_text_linedit_current.text())
+        self.ocr_text_linedit_current.setText(text)
+
+    def refresh_preview_image(self, image):
+        self.image_preview.setImage(image)
+
+    def show_ocr_settings_window(self):
+        self.ocr_settings_window = OCRSettingsWindow(self.master_object)
+        self.ocr_settings_window.show()
 
     def show_hotkey_config(self):
         # global, so it doesn't get garbage collected
@@ -387,11 +488,13 @@ class MainWindow(QWidget):
         self.audio_peak_progressbar.setValue(volume)
 
     def recording_checkbox_toggl(self, state):
-        self.config.config_dict["enable_recording"] = True if state == Qt.Checked else False
+        self.config.config_dict["enable_recording"] = bool(state == Qt.Checked)
         if state == Qt.Checked:
             self.audio_worker.save_audio_and_restart_recording()
+            self.audio_save_button.setEnabled(True)
         else:
             self.audio_worker.stop_recording()
+            self.audio_save_button.setEnabled(False)
 
     def spinbox_valuechange(self):
         self.config.config_dict["recording_seconds"] = self.recording_seconds_spinbox.value()
@@ -401,11 +504,11 @@ class MainWindow(QWidget):
         mic_name = self.mic_combobox.currentText()
         selected_mic = next(x for x in self.mics if x.name == mic_name)
         self.update_audio_progress_thread.stop()
-        self.update_audio_progress_thread.wait(1)
+        self.update_audio_progress_thread.wait()
         self.update_audio_progressbar_in_thread()
 
     class UpdateAudioProgressThread(QThread):
-        volume_signal = pyqtSignal([int])
+        volume_signal = cast(SignalInstance, Signal(int))
 
         def __init__(self):
             QThread.__init__(self)
@@ -422,11 +525,35 @@ class MainWindow(QWidget):
                     data: numpy.ndarray
                     data = rec.record()
                     added_data = [abs(sum(instance)) for instance in data]
-                    volume = int(math.ceil(numpy.mean(added_data) * 100))
+                    volume = int(math.ceil(numpy.mean(added_data) * 1000))  # type: ignore
                     self.volume_signal.emit(volume)
 
         def stop(self):
             self.stop_signal = True
+
+
+class ImagePreview(QLabel):
+    def __init__(self, image=None):
+        super().__init__()
+        self.image = image
+        self.setMinimumSize(350, 170)
+
+        self._update_pixmap()
+
+    def _update_pixmap(self):
+        if self.image:
+            im = ImageQt(self.image).copy()
+            pixmap = QPixmap.fromImage(im).scaled(self.width(), self.height(), Qt.KeepAspectRatio)
+            self.setPixmap(pixmap)
+        else:
+            self.setText("This will show a preview of your screenshots.")
+
+    def setImage(self, image):
+        self.image = image
+        self._update_pixmap()
+
+    def resizeEvent(self, _):
+        self._update_pixmap()
 
 
 class SRSScreenshot:
@@ -440,12 +567,11 @@ class SRSScreenshot:
         selection_window = SelectorWidget(self.app)
         selection_window.show()
         selection_window.activateWindow()
-        if selection_window.exec() == QDialog.Accepted:
-            if selection_window.coordinates:
-                self.srs_image_location.x1 = selection_window.coordinates.x1
-                self.srs_image_location.y1 = selection_window.coordinates.y1
-                self.srs_image_location.x2 = selection_window.coordinates.x2
-                self.srs_image_location.y2 = selection_window.coordinates.y2
+        if selection_window.exec() == QDialog.Accepted and selection_window.coordinates:
+            self.srs_image_location.x1 = selection_window.coordinates.x1
+            self.srs_image_location.y1 = selection_window.coordinates.y1
+            self.srs_image_location.x2 = selection_window.coordinates.x2
+            self.srs_image_location.y2 = selection_window.coordinates.y2
         QApplication.restoreOverrideCursor()
 
     def take_srs_screenshot(self):
@@ -463,7 +589,7 @@ class SRSScreenshot:
             self.srs_image_location.x2 = size.width()
             self.srs_image_location.y2 = size.height()
 
-        image = ImageGrab.grab(
+        image = pyscreenshot.grab(
             bbox=(
                 self.srs_image_location.x1,
                 self.srs_image_location.y1,
@@ -482,9 +608,11 @@ class SRSScreenshot:
             self.take_srs_screenshot()
 
     def take_srs_screenshot_in_thread(self):
-        global srs_screenshot_thread
-        srs_screenshot_thread = SRSScreenshot.SRSScreenshotThread(self, self.config)
-        srs_screenshot_thread.start()
+        with contextlib.suppress(AttributeError):
+            if self.srs_screenshot_thread:
+                self.srs_screenshot_thread.wait()
+        self.srs_screenshot_thread = SRSScreenshot.SRSScreenshotThread(self, self.config)
+        self.srs_screenshot_thread.start()
 
     class SRSScreenshotThread(QThread):
         def __init__(self, srs_screenshot: SRSScreenshot, config: Configuration):
@@ -509,25 +637,23 @@ class SRSScreenshot:
             self.srs_screenshot.trigger_srs_screenshot_on_clipboard_change()
 
 
-def show_ocr_settings_window():
-    global ocr_settings_window
-    ocr_settings_window = OCRSettingsWindow()
-    ocr_settings_window.show()
-
-
 class OCRSettingsWindow(QWidget):
-    def __init__(self):
+    def __init__(self, master_object: MasterObject):
         super().__init__()
+        self.master_object = master_object
+        self.config = self.master_object.config
         self.setWindowTitle("Migaku OCR Settings")
-        self.setWindowFlags(Qt.Dialog)
+        self.setWindowFlags(Qt.Dialog)  # type: ignore
         self.unprocessed_image_label = QLabel()
         self.processed_image_label = QLabel()
+
+        unprocessed_image = master_object.unprocessed_image
+        processed_image = master_object.processed_image
 
         layout = QHBoxLayout()
         left_side_layout = QVBoxLayout()
         right_side_layout = QVBoxLayout()
 
-        global unprocessed_image
         if unprocessed_image:
             im = ImageQt(unprocessed_image).copy()
             pixmap = QPixmap.fromImage(im)
@@ -535,7 +661,6 @@ class OCRSettingsWindow(QWidget):
         else:
             self.unprocessed_image_label.setText("No screenshot taken yet...")
 
-        global processed_image
         if processed_image:
             im = ImageQt(processed_image).copy()
             pixmap = QPixmap.fromImage(im)
@@ -566,41 +691,28 @@ class OCRSettingsWindow(QWidget):
         left_side_widget.setLayout(left_side_layout)
         layout.addWidget(left_side_widget)
 
-        global global_config_dict
-
         def change_upscale_value(state):
-            global_config_dict["ocr_settings"]["upscale_amount"] = state
-            start_ocr_in_thread(unprocessed_image)
-
-        def toogle_grayscale(state):
-            global_config_dict["ocr_settings"]["grayscale"] = True if state == Qt.Checked else False
-            start_ocr_in_thread(unprocessed_image)
-
-        def toogle_sharpen(state):
-            global_config_dict["ocr_settings"]["edge_enhance"] = True if state == Qt.Checked else False
-            start_ocr_in_thread(unprocessed_image)
+            self.config.config_dict["ocr_settings"]["upscale_amount"] = state
+            master_object.ocr.start_ocr_in_thread(unprocessed_image)
 
         upscale_spinbox = QSpinBox()
-        upscale_spinbox.setValue(global_config_dict["ocr_settings"]["upscale_amount"])
+        upscale_spinbox.setValue(self.config.config_dict["ocr_settings"]["upscale_amount"])
         upscale_spinbox.setMinimum(1)
         upscale_spinbox.setMaximum(6)
-        upscale_spinbox.valueChanged.connect(change_upscale_value)
+        upscale_spinbox.valueChanged.connect(change_upscale_value)  # type: ignore
         right_side_layout.addWidget(upscale_spinbox)
 
-        grayscaleCheckBox = QCheckBox("Grayscale")
-        grayscaleCheckBox.setChecked(global_config_dict["ocr_settings"]["grayscale"])
-        grayscaleCheckBox.stateChanged.connect(toogle_grayscale)
-        right_side_layout.addWidget(grayscaleCheckBox)
-
-        sharpenCheckBox = QCheckBox("Sharpen Edges")
-        sharpenCheckBox.setChecked(global_config_dict["ocr_settings"]["edge_enhance"])
-        sharpenCheckBox.stateChanged.connect(toogle_sharpen)
-        right_side_layout.addWidget(sharpenCheckBox)
+        self.blacklist_lineedit = QLineEdit(self.config.config_dict["ocr_settings"]["character_blacklist"])
+        self.blacklist_lineedit.editingFinished.connect(self.change_blacklist_text)  # type: ignore
+        right_side_layout.addWidget(self.blacklist_lineedit)
 
         right_side_widget = QWidget()
         right_side_widget.setLayout(right_side_layout)
         layout.addWidget(right_side_widget)
         self.setLayout(layout)
+
+    def change_blacklist_text(self):
+        self.config.config_dict["ocr_settings"]["character_blacklist"] = self.blacklist_lineedit.text()
 
     def refresh_unprocessed_image(self, image):
         im = ImageQt(image).copy()
@@ -624,46 +736,47 @@ class HotKeySettingsWindow(QWidget):
 
         self.main_hotkey_qobject.stop()
 
-        self.original_config = copy.deepcopy(global_config_dict)
+        self.original_config = copy.deepcopy(config.config_dict)
 
         self.setWindowTitle("Migaku OCR Hotkey Settings")
-        self.setWindowFlags(Qt.Dialog)
+        self.setWindowFlags(Qt.Dialog)  # type: ignore
         layout = QVBoxLayout()
 
         self.hotkeyCheckBox = QCheckBox("Enable Global Hotkeys")
-        self.hotkeyCheckBox.setChecked(global_config_dict["enable_global_hotkeys"])
-        self.hotkeyCheckBox.stateChanged.connect(self.checkboxToggl)
+        self.hotkeyCheckBox.setChecked(config.config_dict["enable_global_hotkeys"])
+        self.hotkeyCheckBox.stateChanged.connect(self.checkbox_toggl)  # type: ignore
 
         layout.addWidget(self.hotkeyCheckBox)
-        singleScreenshotHotkeyField = HotKeyField("single_screenshot_hotkey", "Single screenshot OCR")
-        layout.addWidget(singleScreenshotHotkeyField)
-        persistentWindowHotkeyField = HotKeyField("persistent_window_hotkey", "Spawn persistent window")
-        layout.addWidget(persistentWindowHotkeyField)
-        persistentScreenshotHotkeyField = HotKeyField("persistent_screenshot_hotkey", "Persistent window OCR")
-        layout.addWidget(persistentScreenshotHotkeyField)
-        stopRecordingHotkeyField = HotKeyField("stop_recording_hotkey", "Stop recording")
-        layout.addWidget(stopRecordingHotkeyField)
+        single_screenshot_hotkey_field = HotKeyField(config, "single_screenshot_hotkey", "Single screenshot OCR")
+        layout.addWidget(single_screenshot_hotkey_field)
+        persistent_window_hotkey_field = HotKeyField(config, "persistent_window_hotkey", "Spawn persistent window")
+        layout.addWidget(persistent_window_hotkey_field)
+        persistent_screenshot_hotkey_field = HotKeyField(
+            config, "persistent_screenshot_hotkey", "Persistent window OCR"
+        )
+        layout.addWidget(persistent_screenshot_hotkey_field)
+        stop_recording_hotkey_field = HotKeyField(config, "stop_recording_hotkey", "Stop recording")
+        layout.addWidget(stop_recording_hotkey_field)
 
-        buttonLayout = QHBoxLayout()
-        layout.addLayout(buttonLayout)
+        button_layout = QHBoxLayout()
+        layout.addLayout(button_layout)
         self.okButton = QPushButton("OK")
-        self.okButton.clicked.connect(self.saveClose)
-        buttonLayout.addWidget(self.okButton)
+        self.okButton.clicked.connect(self.save_close)  # type: ignore
+        button_layout.addWidget(self.okButton)
         self.cancelButton = QPushButton("Cancel")
-        self.cancelButton.clicked.connect(self.cancelClose)
-        buttonLayout.addWidget(self.cancelButton)
+        self.cancelButton.clicked.connect(self.cancel_close)  # type: ignore
+        button_layout.addWidget(self.cancelButton)
         self.setLayout(layout)
 
-    def checkboxToggl(self, state):
-        global_config_dict["enable_global_hotkeys"] = True if state == Qt.Checked else False
+    def checkbox_toggl(self, state):
+        self.config.config_dict["enable_global_hotkeys"] = bool(state == Qt.Checked)
 
-    def saveClose(self):
+    def save_close(self):
         self.config.save_config()
         self.close()
 
-    def cancelClose(self):
-        global global_config_dict
-        global_config_dict = self.original_config
+    def cancel_close(self):
+        self.config.config_dict = self.original_config
         self.close()
 
     def closeEvent(self, *args, **kwargs):
@@ -672,34 +785,35 @@ class HotKeySettingsWindow(QWidget):
 
 
 class HotKeyField(QWidget):
-    def __init__(self, hotkey_functionality: str, hotkey_name: str):
+    def __init__(self, config: Configuration, hotkey_functionality: str, hotkey_name: str):
         super().__init__()
         hotkey_label = QLabel(hotkey_name)
         layout = QHBoxLayout()
         layout.addWidget(hotkey_label)
 
-        self.keyEdit = KeySequenceLineEdit(hotkey_functionality)
+        self.keyEdit = KeySequenceLineEdit(config, hotkey_functionality)
         layout.addWidget(self.keyEdit)
 
         self.clearButton = QPushButton("Clear")
-        self.clearButton.clicked.connect(self.keyEdit.clear)
+        self.clearButton.clicked.connect(self.keyEdit.clear)  # type: ignore
         layout.addWidget(self.clearButton)
 
         self.setLayout(layout)
 
 
 class KeySequenceLineEdit(QLineEdit):
-    def __init__(self, hotkey_functionality: str):
+    def __init__(self, config: Configuration, hotkey_functionality: str):
         super().__init__()
+        self.config = config
         self.modifiers: Qt.KeyboardModifiers = Qt.NoModifier  # type: ignore
         self.key: Qt.Key = Qt.Key_unknown
         self.keysequence = QKeySequence()
         self.hotkey_functionality = hotkey_functionality
-        self.setText(self.getQtText(global_config_dict["hotkeys"][self.hotkey_functionality]))
+        self.setText(self.getQtText(config.config_dict["hotkeys"][self.hotkey_functionality]))
 
     def clear(self):
         self.setText("")
-        global_config_dict["hotkeys"][self.hotkey_functionality] = ""
+        self.config.config_dict["hotkeys"][self.hotkey_functionality] = ""
 
     def keyPressEvent(self, event):
         super().keyPressEvent(event)
@@ -709,7 +823,7 @@ class KeySequenceLineEdit(QLineEdit):
         self.updateConfig()
 
     def updateConfig(self):
-        global_config_dict["hotkeys"][self.hotkey_functionality] = self.getPynputText()
+        self.config.config_dict["hotkeys"][self.hotkey_functionality] = self.getPynputText()
 
     def updateKeySequence(self):
         if self.key not in valid_keys:
@@ -758,14 +872,13 @@ class PersistentWindow(QWidget):
         self.is_resizing = False
         self.is_moving = False
 
-        self.move(x, y)
-        self.resize(w, h)
         self.setMouseTracking(True)
         self.original_cursor_x = 0
         self.original_cursor_y = 0
         self.original_window_x = 0
         self.original_window_y = 0
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.master_object = master_object
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -801,7 +914,7 @@ class PersistentWindow(QWidget):
         innerLayout = QHBoxLayout()
         ocrButton = QPushButton()
         ocrButton.setIcon(QIcon("ocr_icon.png"))
-        ocrButton.clicked.connect(master_object.take_screenshot_from_persistent_window)
+        ocrButton.clicked.connect(master_object.take_screenshot_from_persistent_window)  # type: ignore
         ocrButton.setStyleSheet(
             """
             QPushButton {
@@ -820,6 +933,7 @@ class PersistentWindow(QWidget):
         innerWidget.setLayout(innerLayout)
         layout.addWidget(middleWidget)
         self.setLayout(layout)
+        self.setGeometry(x, y, w, h)
 
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
@@ -835,8 +949,8 @@ class PersistentWindow(QWidget):
             QApplication.setOverrideCursor(Qt.ClosedHandCursor)
 
         if event.button() == Qt.RightButton:
-            self.drag_x = event.globalX()
-            self.drag_y = event.globalY()
+            self.drag_x = event.globalPosition().x()
+            self.drag_y = event.globalPosition().y()
             self.drag_w = self.width()
             self.drag_h = self.height()
             self.is_resizing = True
@@ -867,8 +981,8 @@ class PersistentWindow(QWidget):
         if self.is_resizing:
 
             def make_size_follow_cursor():
-                w = max(50, self.drag_w + event.globalX() - self.drag_x)
-                h = max(50, self.drag_h + event.globalY() - self.drag_y)
+                w = max(50, self.drag_w + event.globalPosition().x() - self.drag_x)
+                h = max(50, self.drag_h + event.globalPosition().y() - self.drag_y)
                 self.resize(w, h)
                 # self.overlay = QPixmap(w, h)
                 # self.overlay.fill(Qt.transparent)
@@ -884,11 +998,14 @@ class PersistentWindow(QWidget):
     def keyPressEvent(self, event):
 
         if event.key() in [Qt.Key_Return, Qt.Key_Enter]:
-            global closed_persistent_window
-            closed_persistent_window.x1 = self.x()
-            closed_persistent_window.y1 = self.y()
-            closed_persistent_window.x2 = closed_persistent_window.x1 + self.width()
-            closed_persistent_window.y2 = closed_persistent_window.y1 + self.height()
+            self.master_object.closed_persistent_window.x1 = self.x()
+            self.master_object.closed_persistent_window.y1 = self.y()
+            self.master_object.closed_persistent_window.x2 = (
+                self.master_object.closed_persistent_window.x1 + self.width()
+            )
+            self.master_object.closed_persistent_window.y2 = (
+                self.master_object.closed_persistent_window.y1 + self.height()
+            )
 
             self.close()
 
@@ -910,20 +1027,22 @@ class MasterObject:
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
         self.config = Configuration()
-        global global_config_dict
-        global_config_dict = self.config.config_dict
         self.srs_screenshot = SRSScreenshot(self.app, self.config)
-        self.audio_worker = AudioWorker()
+        self.audio_worker = AudioWorker(self.config)
         self.main_hotkey_qobject = MainHotkeyQObject(self.config, self, self.audio_worker)
+        self.ocr = OCR(self)
+        self.persistent_window: Optional[PersistentWindow] = None
+        self.unprocessed_image: Optional[Image.Image] = None
+        self.processed_image: Optional[Image.Image] = None
+        self.closed_persistent_window = Rectangle()
         # this allows for ctrl-c to close the application
-        timer = QTimer()
-        timer.start(500)
-        timer.timeout.connect(lambda: None)
+        signal.signal(signal.SIGINT, lambda *_: self.app.quit())
+
         self.setup_tray()
 
         self.show_main_window()
 
-        sys.exit(self.app.exec_())
+        sys.exit(self.app.exec())
 
     def setup_tray(self):
         icon = QIcon("migaku_icon.png")
@@ -931,17 +1050,17 @@ class MasterObject:
         self.tray = QSystemTrayIcon()
         self.tray.setIcon(icon)
         self.tray.setVisible(True)
-        menu = QMenu()
+        self.menu = QMenu()
 
-        openMain = QAction("Open")
-        openMain.triggered.connect(self.show_main_window)
-        quit = QAction("Quit")
-        quit.triggered.connect(self.app.quit)
+        self.openMain = QAction("Open")
+        self.openMain.triggered.connect(self.show_main_window)  # type: ignore
+        self.quit = QAction("Quit")
+        self.quit.triggered.connect(self.app.quit)  # type: ignore
 
-        menu.addAction(openMain)
-        menu.addAction(quit)
+        self.menu.addAction(self.openMain)
+        self.menu.addAction(self.quit)
 
-        self.tray.setContextMenu(menu)
+        self.tray.setContextMenu(self.menu)
 
     def show_main_window(self):
         self.main_window = MainWindow(
@@ -955,14 +1074,22 @@ class MasterObject:
         selector = SelectorWidget(self.app)
         selector.show()
         selector.activateWindow()
-        if selector.exec() == QDialog.Accepted:
-            if selector.selectedPixmap:
-                image = convert_qpixmap_to_pil_image(selector.selectedPixmap)
-                start_ocr_in_thread(image)
+        if selector.exec() == QDialog.Accepted and selector.selectedPixmap:
+            image = convert_qpixmap_to_pil_image(selector.selectedPixmap)
+            self.ocr.start_ocr_in_thread(image)
         QApplication.restoreOverrideCursor()
 
     def show_persistent_screenshot_window(self):
-        self.persistent_window = PersistentWindow(self)
+        if self.closed_persistent_window.has_been_filled():
+            self.persistent_window = PersistentWindow(
+                self,
+                x=self.closed_persistent_window.x1,
+                y=self.closed_persistent_window.y1,
+                w=self.closed_persistent_window.get_width(),
+                h=self.closed_persistent_window.get_height(),
+            )
+        else:
+            self.persistent_window = PersistentWindow(self)
         self.persistent_window.show()
 
     def take_screenshot_from_persistent_window(self):
@@ -970,10 +1097,10 @@ class MasterObject:
         persistent_window = self.persistent_window
         global closed_persistent_window
         if not persistent_window and (
-            not closed_persistent_window.x1
-            and not closed_persistent_window.y1
-            and not closed_persistent_window.x2
-            and not closed_persistent_window.y2
+            not self.closed_persistent_window.x1
+            and not self.closed_persistent_window.y1
+            and not self.closed_persistent_window.x2
+            and not self.closed_persistent_window.y2
         ):
             logger.warning("persistent window not initialized yet or persistent_window location not saved")
         else:
@@ -983,11 +1110,11 @@ class MasterObject:
                 x2 = x1 + persistent_window.width()
                 y2 = y1 + persistent_window.height()
             else:
-                x1 = closed_persistent_window.x1
-                y1 = closed_persistent_window.y1
-                x2 = closed_persistent_window.x2
-                y2 = closed_persistent_window.y2
-            image = ImageGrab.grab(bbox=(x1, y1, x2, y2))
+                x1 = self.closed_persistent_window.x1
+                y1 = self.closed_persistent_window.y1
+                x2 = self.closed_persistent_window.x2
+                y2 = self.closed_persistent_window.y2
+            image = pyscreenshot.grab(bbox=(x1, y1, x2, y2))
             if image and persistent_window and persistent_window.ocrButton.isVisible():
                 button = persistent_window.ocrButton
                 x1 = button.x()
@@ -999,7 +1126,7 @@ class MasterObject:
                     for y in range(height):
                         image.putpixel((x1 + x, y1 + y), color)
 
-            start_ocr_in_thread(image)
+            self.ocr.start_ocr_in_thread(image)
 
 
 class MainHotkeyQObject(QObject):
@@ -1019,24 +1146,21 @@ class MainHotkeyQObject(QObject):
         self.manager.start()
 
     def stop(self):
-        try:
+        with contextlib.suppress(AttributeError):
             self.manager.hotkey.stop()
-        except AttributeError:
-            pass
 
 
 class KeyBoardManager(QObject):
-    single_screenshot_signal = pyqtSignal()
-    persistent_window_signal = pyqtSignal()
-    persistent_screenshot_signal = pyqtSignal()
-    stop_recording_signal = pyqtSignal()
+    single_screenshot_signal = cast(SignalInstance, Signal())
+    persistent_window_signal = cast(SignalInstance, Signal())
+    persistent_screenshot_signal = cast(SignalInstance, Signal())
+    stop_recording_signal = cast(SignalInstance, Signal())
 
     def __init__(self, config: Configuration):
         super().__init__()
         self.config = config
 
     def start(self):
-        global global_config_dict
         hotkey_config = self.config.config_dict["hotkeys"]
         # this puts the the user hotkeys into the following format: https://tinyurl.com/vzs2a2rd
         hotkey_dict = {}
@@ -1053,83 +1177,270 @@ class KeyBoardManager(QObject):
         self.hotkey.start()
 
 
-class OCRThread(QThread):
-    unprocessed_signal = pyqtSignal([Image.Image])
-    processed_signal = pyqtSignal([Image.Image])
-    ocr_text_signal = pyqtSignal([str])
+class OCR:
+    def __init__(self, master_object: MasterObject):
+        self.master_object = master_object
+        self.ocr_thread: Optional[OCR.OCRThread] = None
+        self.api = None
+        self.jpn_api = None
+        self.jpn_vert_api = None
 
-    def __init__(self, image, parent=None):
-        QThread.__init__(self, parent)
-        self.image = image
+    class OCRThread(QThread):
+        unprocessed_signal = cast(SignalInstance, Signal(Image.Image))
+        processed_signal = cast(SignalInstance, Signal(Image.Image))
+        ocr_text_signal = cast(SignalInstance, Signal(str))
 
-    def run(self):
-        start_ocr(self.image, self.unprocessed_signal, self.processed_signal, self.ocr_text_signal)
+        def __init__(self, ocr: OCR, image, skip_override: bool):
+            QThread.__init__(self)
+            self.image = image
+            self.ocr = ocr
+            self.skip_override = skip_override
+
+        def run(self):
+            self.ocr.start_ocr(
+                self.image, self.unprocessed_signal, self.processed_signal, self.ocr_text_signal, self.skip_override
+            )
+
+    def start_ocr_in_thread(self, image, skip_override=False):
+        if image:
+            if self.ocr_thread:
+                self.ocr_thread.wait()
+            self.ocr_thread = OCR.OCRThread(self, image, skip_override)
+            ocr_settings_window = self.master_object.main_window.ocr_settings_window
+            main_window = self.master_object.main_window
+            if ocr_settings_window:
+                self.ocr_thread.unprocessed_signal.connect(ocr_settings_window.refresh_unprocessed_image)
+                self.ocr_thread.processed_signal.connect(ocr_settings_window.refresh_processed_image)
+                self.ocr_thread.ocr_text_signal.connect(ocr_settings_window.refresh_ocr_text)
+            if main_window:
+                self.ocr_thread.ocr_text_signal.connect(main_window.update_linedit_text)
+            if self.master_object.main_window:
+                self.ocr_thread.processed_signal.connect(self.master_object.main_window.refresh_preview_image)
+            self.ocr_thread.start()
+
+    def start_ocr(
+        self,
+        image: Image.Image,
+        unprocessed_signal: SignalInstance,
+        processed_signal: SignalInstance,
+        ocr_text_signal: SignalInstance,
+        skip_override: bool,
+    ):
+        self.master_object.unprocessed_image = image.copy()
+        unprocessed_signal.emit(self.master_object.unprocessed_image)
+
+        override_options: list[dict[str, Any]] = [
+            {},
+            {"ocr_settings": {"thresholding_algorithm": "NICK"}},
+            {"ocr_settings": {"thresholding_algorithm": "WAN"}},
+            {"invert_color": True},
+        ]
+        if skip_override:
+            override_options = [{}]
+
+        image_processor = ImageProcessor(self.master_object.config, image)
+        text = ""
+        initial_text = ""
+        initial_image = None
+        for retries, override_option in enumerate(override_options):
+            image = image_processor.process_image(override_option)
+            text = self.do_ocr(image)
+            if retries == 0:
+                initial_text = text
+                initial_image = image.copy()
+            if not self.retry_necessary(text):
+                break
+            elif retries == len(override_options) - 1:
+                text = initial_text
+                assert initial_image is not None
+                image = initial_image
+                if not skip_override:
+                    logger.info("Failed with all override_options, original text might contain blacklisted chars")
+            if not skip_override:
+                logger.info(
+                    f"Ocr failed, retrying with option {override_option} retries: {retries} recognized text: {text}"
+                )
+
+        processed_signal.emit(image)
+        self.master_object.processed_image = image
+        ocr_text_signal.emit(text)
+
+        process_text(text)
+
+    def retry_necessary(self, text):
+        config = self.master_object.config
+        if not text.strip():
+            return True
+        return any(char.lower() in config.config_dict["ocr_settings"]["character_blacklist"] for char in text)
+
+    def do_ocr(self, image: Image.Image):
+        width, height = image.size
+        if platform.system() == "Windows":
+            path = os.path.abspath("tesseract/tesseract.exe")
+            pytesseract.pytesseract.tesseract_cmd = path
+        if width > height:
+            if not self.jpn_api:
+                self.jpn_api = PyTessBaseAPI(lang="jpn", psm=PSM.SINGLE_BLOCK, oem=OEM.LSTM_ONLY)
+            self.api = self.jpn_api
+        else:
+            if not self.jpn_vert_api:
+                self.jpn_vert_api = PyTessBaseAPI(lang="jpn_vert", psm=PSM.SINGLE_BLOCK_VERT_TEXT, oem=OEM.LSTM_ONLY)
+            self.api = self.jpn_vert_api
+
+        assert self.api is not None
+        self.api.SetImage(image)
+        text = self.api.GetUTF8Text().strip()
+
+        for (f, t) in [
+            (" ", ""),
+            ("いぃ", "い"),
+            ("\n", ""),
+            ("①", "１"),
+            ("②", "２"),
+            ("③", "３"),
+            ("④", "４"),
+            ("⑤", "５"),
+            ("⑥", "６"),
+            ("⑦", "７"),
+            ("⑧", "８"),
+            ("⑨", "９"),
+            ("⑩", "１０"),
+            ("⑪", "１１"),
+            ("⑫", "１２"),
+            ("⑬", "１３"),
+            ("⑭", "１４"),
+            ("⑮", "１５"),
+            ("⑯", "１６"),
+            ("⑰", "１７"),
+            ("⑱", "１８"),
+            ("⑲", "１９"),
+            ("⑳", "２０"),
+        ]:
+            text = text.replace(f, t)
+        logger.info(text)
+        return text
 
 
-def start_ocr_in_thread(image):
-    if image:
-        global ocr_thread
-        if ocr_thread:
-            ocr_thread.wait()
-        ocr_thread = OCRThread(image)
-        ocr_thread.start()
-        global ocr_settings_window
-        if ocr_settings_window:
-            ocr_thread.unprocessed_signal.connect(ocr_settings_window.refresh_unprocessed_image)
-            ocr_thread.processed_signal.connect(ocr_settings_window.refresh_processed_image)
-            ocr_thread.ocr_text_signal.connect(ocr_settings_window.refresh_ocr_text)
+class ImageProcessor:
+    def __init__(self, config: Configuration, original_image: Image.Image) -> None:
+        self.config = config
+        self.original_image = original_image
+        self.inverted = False
 
+    def process_image(self, override_option: dict[str, Any]) -> Image.Image:
+        override_option_copy = override_option.copy()
+        config_dict = merge(override_option_copy, self.config.config_dict.copy())
+        image = self.original_image.copy()
+        is_grayscale = self.check_if_is_grayscale(image)
 
-def start_ocr(
-    image: Image.Image,
-    unprocessed_signal: pyqtBoundSignal,
-    processed_signal: pyqtBoundSignal,
-    ocr_text_signal: pyqtBoundSignal,
-):
-    global unprocessed_image
-    unprocessed_image = image.copy()
-    unprocessed_signal.emit(unprocessed_image)
+        image = self.increase_image_size(config_dict, image)
+        image = self.threshold_image(config_dict, image, is_grayscale)
+        image = self.smart_invert_image(config_dict, image)
+        image = self.add_border(image)
 
-    image = process_image(image)
+        return image
 
-    processed_signal.emit(image)
-    global processed_image
-    processed_image = image
+    def add_border(self, image: Image.Image) -> Image.Image:
+        if self.config.config_dict["ocr_settings"]["add_border"]:
+            return ImageOps.expand(image, 10, fill="white")
+        else:
+            return image
 
-    text = do_ocr(image)
-    ocr_text_signal.emit(text)
-    process_text(text)
+    def check_if_is_grayscale(self, image: Image.Image) -> bool:
+        pixels = cast(PyAccess, image.load())
 
+        width, height = image.size
+        diff = 0
+        for x in range(width):
+            for y in range(height):
+                r, g, b = pixels[x, y]
+                rg = abs(r - g)
+                rb = abs(r - b)
+                gb = abs(g - b)
+                diff += rg + rb + gb
+        abs_diff = diff / (height * width)
+        return abs_diff < 5
 
-def process_image(image: Image.Image):
-    upscale_amount = global_config_dict["ocr_settings"]["upscale_amount"]
-    image = image.resize((image.width * upscale_amount, image.height * upscale_amount))
-    if global_config_dict["ocr_settings"]["grayscale"]:
-        image = ImageOps.grayscale(image)
-    if global_config_dict["ocr_settings"]["edge_enhance"]:
-        image = image.filter(ImageFilter.EDGE_ENHANCE)
-    return image
+    def increase_image_size(self, config_dict: dict, image: Union[numpy.ndarray, Image.Image]) -> Image.Image:
+        image = self.smart_convert_to_pillow(image)
+        upscale_amount = config_dict["ocr_settings"]["upscale_amount"]
+        image = image.resize((image.width * upscale_amount, image.height * upscale_amount))
+        return image
 
+    def threshold_image(self, config_dict: dict, image: Image.Image, is_grayscale: bool):
+        pillow_image: Optional[Image.Image] = None
+        if config_dict["ocr_settings"]["automatic_thresholding"]:
+            if is_grayscale:
+                return image
+            grayscale_image = self.pillow_to_doxa(image)
+            binary_image = numpy.empty(grayscale_image.shape, grayscale_image.dtype)
 
-def do_ocr(image: Image.Image):
-    width, height = image.size
-    language = ""
-    if platform.system() == "Windows":
-        path = os.path.abspath("tesseract/tesseract.exe")
-        pytesseract.pytesseract.tesseract_cmd = path
-    if width > height:
-        language = "jpn"
-        tesseract_config = "--oem 1 --psm 6"
-    else:
-        language = "jpn_vert"
-        tesseract_config = "--oem 1 --psm 5"
-    text = pytesseract.image_to_string(image, lang=language, config=tesseract_config)
-    text = text.strip()
+            algorithm = algorithms[config_dict["ocr_settings"]["thresholding_algorithm"]]
+            # Pick an algorithm from the DoxaPy library and convert the image to binary
+            doxa = doxapy.Binarization(algorithm)
+            doxa.initialize(grayscale_image)
+            doxa.to_binary(binary_image, {"window": 75, "k": 0.2})
+            pillow_image = self.doxa_to_pillow(binary_image)
 
-    for (f, t) in [(" ", ""), ("いぃ", "い"), ("\n", "")]:
-        text = text.replace(f, t)
-    logger.info(text)
-    return text
+        else:
+            opencv_image = self.smart_convert_to_opencv(image)
+            opencv_image = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
+            opencv_image = cv2.threshold(
+                opencv_image, config_dict["ocr_settings"]["thresholding_value"], 255, cv2.THRESH_BINARY
+            )[1]
+            pillow_image = self.opencv_to_pillow(opencv_image)
+        return pillow_image
+
+    def smart_convert_to_pillow(self, image: Union[numpy.ndarray, Image.Image]) -> Image.Image:
+        if isinstance(image, numpy.ndarray):
+            image = self.opencv_to_pillow(image)
+        return image
+
+    def smart_convert_to_opencv(self, image: Union[numpy.ndarray, Image.Image]) -> numpy.ndarray:
+        if isinstance(image, Image.Image):
+            image = self.pillow_to_opencv(image)
+        return image
+
+    def smart_invert_image(self, config_dict: dict, image: Image.Image) -> Image.Image:
+        if config_dict.get("invert_color", False):
+            if self.inverted:
+                print("forcibly not inverting")
+                return image
+            else:
+                print("forcibly inverting")
+                return ImageOps.invert(image)
+        else:
+            self.inverted = False
+        if config_dict["ocr_settings"]["smart_image_inversion"]:
+            colors = sorted(image.getcolors(image.size[0] * image.size[1]))
+            if isinstance(colors[-1][-1], int):
+                if colors[-1][-1] < 128:
+                    self.inverted = True
+                    image = ImageOps.invert(image)
+            else:
+                colors = cast(list[tuple[int, tuple[int, int, int]]], colors)
+                _, (r, g, b) = colors[-1]
+
+                if r < 128 and g < 128 and b < 128:
+                    self.inverted = True
+                    image = ImageOps.invert(image)
+
+        return image
+
+    # both from: https://stackoverflow.com/a/48602446/8825153
+    def opencv_to_pillow(self, opencv_image: numpy.ndarray) -> Image.Image:
+        color_coverted = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(color_coverted)
+
+    def pillow_to_opencv(self, pillow_image: Image.Image) -> numpy.ndarray:
+        numpy_image = numpy.array(pillow_image)
+        return cv2.cvtColor(numpy_image, cv2.COLOR_RGB2BGR)
+
+    def pillow_to_doxa(self, pillow_image: Image.Image) -> numpy.ndarray:
+        return numpy.array(pillow_image.convert("L"))
+
+    def doxa_to_pillow(self, doxa_image: numpy.ndarray) -> Image.Image:
+        return Image.fromarray(doxa_image)
 
 
 def process_text(text: str):
@@ -1149,14 +1460,14 @@ def process_text(text: str):
 
 
 def capture_desktop(app: QApplication):
-    desktop_pixmap = QPixmap(QApplication.desktop().size())
+    desktop_pixmap = QPixmap(app.screens()[0].virtualSize())
+
     painter = QPainter(desktop_pixmap)
     for screen in app.screens():
         painter.drawPixmap(
             screen.geometry().topLeft(),
             screen.grabWindow(0),  # type: ignore
         )
-    # painter.end()
     return desktop_pixmap
 
 
@@ -1165,7 +1476,7 @@ class SelectorWidget(QDialog):
         super().__init__()
         if platform.system() == "Linux":
             self.setWindowFlags(
-                Qt.FramelessWindowHint
+                Qt.FramelessWindowHint  # type: ignore
                 | Qt.WindowStaysOnTopHint
                 | Qt.Tool
                 | Qt.X11BypassWindowManagerHint  # type: ignore
@@ -1177,7 +1488,7 @@ class SelectorWidget(QDialog):
                 Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowFullscreenButtonHint  # type: ignore
             )
 
-        self.setGeometry(QApplication.desktop().geometry())
+        self.setGeometry(app.screens()[0].virtualGeometry())
         self.desktopPixmap = capture_desktop(app)
         self.selectedRect = QRect()
         self.selectedPixmap = None
@@ -1189,18 +1500,18 @@ class SelectorWidget(QDialog):
             self.reject()
 
     def mousePressEvent(self, event: QMouseEvent):
-        self.selectedRect.setTopLeft(event.globalPos())
-        self.coordinates.x1 = event.globalX()
-        self.coordinates.y1 = event.globalY()
+        self.selectedRect.setTopLeft(event.globalPosition().toPoint())
+        self.coordinates.x1 = event.globalPosition().x()
+        self.coordinates.y1 = event.globalPosition().y()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        self.selectedRect.setBottomRight(event.globalPos())
+        self.selectedRect.setBottomRight(event.globalPosition().toPoint())
         self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         self.selectedPixmap = self.desktopPixmap.copy(self.selectedRect.normalized())
-        self.coordinates.x2 = event.globalX()
-        self.coordinates.y2 = event.globalY()
+        self.coordinates.x2 = event.globalPosition().x()
+        self.coordinates.y2 = event.globalPosition().y()
         self.accept()
 
     def paintEvent(self, _: QPaintEvent) -> None:
@@ -1210,14 +1521,13 @@ class SelectorWidget(QDialog):
         painter.fillPath(path, QColor.fromRgb(255, 255, 255, 200))
         painter.setPen(Qt.red)
         painter.drawRect(self.selectedRect)
-        # painter.end()
 
 
 def convert_qpixmap_to_pil_image(pixmap: QPixmap):
     q_image = pixmap.toImage()
     buffer = QBuffer()
-    buffer.open(QBuffer.ReadWrite)
-    q_image.save(buffer, "PNG")
+    buffer.open(QBuffer.ReadWrite)  # type: ignore
+    q_image.save(buffer, "PNG")  # type: ignore
     return Image.open(io.BytesIO(buffer.data()))  # type: ignore
 
 
@@ -1231,7 +1541,8 @@ def convert_to_hiragana(text):
 
 
 class AudioWorker:
-    def __init__(self):
+    def __init__(self, config: Configuration):
+        self.config = config
         self.audio_recorder_thread: Optional[AudioWorker.AudioRecorderThread] = None
         self.audio_processing_thread: Optional[AudioWorker.AudioProcessorThread] = None
 
@@ -1242,26 +1553,27 @@ class AudioWorker:
     def _start_recording(self):
         if self.audio_recorder_thread:
             self.stop_recording()
-        self.audio_recorder_thread = AudioWorker.AudioRecorderThread(self)
-        self.audio_recorder_thread.finished.connect(self._process_audio)
+        self.audio_recorder_thread = AudioWorker.AudioRecorderThread(self.config, self)
+        self.audio_recorder_thread.completed.connect(self._process_audio)
         self.audio_recorder_thread.start()
 
     def stop_recording(self) -> None:
         if self.audio_recorder_thread:
             self.audio_recorder_thread.stop_recording = True
-            self.audio_recorder_thread.wait(3)
+            self.audio_recorder_thread.wait()
 
     def _process_audio(self, audio_deque):
         if self.audio_processing_thread:
-            self.audio_processing_thread.wait(2)
+            self.audio_processing_thread.wait()
         self.audio_processing_thread = AudioWorker.AudioProcessorThread(audio_deque)
         self.audio_processing_thread.start()
 
     class AudioRecorderThread(QThread):
-        finished = pyqtSignal([deque])
+        completed = cast(SignalInstance, Signal(deque))
 
-        def __init__(self, audio_worker: AudioWorker, parent=None) -> None:
-            QThread.__init__(self, parent)
+        def __init__(self, config: Configuration, audio_worker: AudioWorker) -> None:
+            QThread.__init__(self)
+            self.config = config
             self.stop_recording = False
             self.audio_worker = audio_worker
 
@@ -1281,12 +1593,13 @@ class AudioWorker:
             with loopback.recorder(samplerate=samplerate) as rec:
                 while True:
                     if self.stop_recording:
+                        logger.info("Got recording stop signal")
                         break
                     data = rec.record(numframes=samplerate)
                     audio_deque.append(data)
-                    if len(audio_deque) > global_config_dict["recording_seconds"]:
+                    if len(audio_deque) > self.config.config_dict["recording_seconds"]:
                         audio_deque.popleft()
-            self.finished.emit(audio_deque)
+            self.completed.emit(audio_deque)
 
     class AudioProcessorThread(QThread):
         def __init__(self, audio_deque):
