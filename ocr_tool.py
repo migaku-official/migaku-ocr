@@ -1,5 +1,8 @@
 from __future__ import annotations
-from tesserocr import PyTessBaseAPI, PSM, OEM
+import easyocr
+import time
+import imagehash  # type: ignore
+from tesserocr import PyTessBaseAPI, PSM, OEM  # type: ignore
 
 import contextlib
 import signal
@@ -110,14 +113,14 @@ class Rectangle:
         self.x2 = x2
         self.y2 = y2
 
+    def __bool__(self):
+        return bool(self.x2 or self.y1 or self.x2 or self.y2)
+
     def get_width(self) -> int:
         return self.x2 - self.x1
 
     def get_height(self) -> int:
         return self.y2 - self.y1
-
-    def has_been_filled(self):
-        return bool(self.x2 or self.y1 or self.x2 or self.y2)
 
 
 # from: https://stackoverflow.com/a/7205107
@@ -1037,6 +1040,7 @@ class MasterObject:
         self.closed_persistent_window = Rectangle()
         # this allows for ctrl-c to close the application
         signal.signal(signal.SIGINT, lambda *_: self.app.quit())
+        self.start_audo_ocr_in_thread()
 
         self.setup_tray()
 
@@ -1080,7 +1084,7 @@ class MasterObject:
         QApplication.restoreOverrideCursor()
 
     def show_persistent_screenshot_window(self):
-        if self.closed_persistent_window.has_been_filled():
+        if self.closed_persistent_window:
             self.persistent_window = PersistentWindow(
                 self,
                 x=self.closed_persistent_window.x1,
@@ -1092,28 +1096,31 @@ class MasterObject:
             self.persistent_window = PersistentWindow(self)
         self.persistent_window.show()
 
+    def get_persistent_window_coordinates(self) -> tuple[float, float, float, float]:
+        if self.persistent_window:
+            x1 = self.persistent_window.x()
+            y1 = self.persistent_window.y()
+            x2 = x1 + self.persistent_window.width()
+            y2 = y1 + self.persistent_window.height()
+        elif self.closed_persistent_window:
+            x1 = self.closed_persistent_window.x1
+            y1 = self.closed_persistent_window.y1
+            x2 = self.closed_persistent_window.x2
+            y2 = self.closed_persistent_window.y2
+        else:
+            x1 = 0
+            y1 = 0
+            x2 = 0
+            y2 = 0
+        return (x1, y1, x2, y2)
+
     def take_screenshot_from_persistent_window(self):
         self.srs_screenshot.take_srs_screenshot_in_thread()
         persistent_window = self.persistent_window
-        global closed_persistent_window
-        if not persistent_window and (
-            not self.closed_persistent_window.x1
-            and not self.closed_persistent_window.y1
-            and not self.closed_persistent_window.x2
-            and not self.closed_persistent_window.y2
-        ):
+        if not persistent_window and not self.closed_persistent_window:
             logger.warning("persistent window not initialized yet or persistent_window location not saved")
         else:
-            if persistent_window:
-                x1 = persistent_window.x()
-                y1 = persistent_window.y()
-                x2 = x1 + persistent_window.width()
-                y2 = y1 + persistent_window.height()
-            else:
-                x1 = self.closed_persistent_window.x1
-                y1 = self.closed_persistent_window.y1
-                x2 = self.closed_persistent_window.x2
-                y2 = self.closed_persistent_window.y2
+            x1, y1, x2, y2 = self.get_persistent_window_coordinates()
             image = pyscreenshot.grab(bbox=(x1, y1, x2, y2))
             if image and persistent_window and persistent_window.ocrButton.isVisible():
                 button = persistent_window.ocrButton
@@ -1127,6 +1134,45 @@ class MasterObject:
                         image.putpixel((x1 + x, y1 + y), color)
 
             self.ocr.start_ocr_in_thread(image)
+
+    def start_audo_ocr_in_thread(self):
+        self.update_audio_progress_thread = MasterObject.AutoOcrThread(self)
+        self.update_audio_progress_thread.persistent_auto_signal.connect(self.take_screenshot_from_persistent_window)
+        self.update_audio_progress_thread.start()
+
+    class AutoOcrThread(QThread):
+        persistent_auto_signal = cast(SignalInstance, Signal())
+
+        def __init__(self, master_object: MasterObject):
+            QThread.__init__(self)
+            self.stop_signal = False
+            self.master_object = master_object
+
+        def run(self):
+            hash1 = None
+            changing = False
+            while not self.stop_signal:
+                if self.master_object.persistent_window or self.master_object.closed_persistent_window:
+                    x1, y1, x2, y2 = self.master_object.get_persistent_window_coordinates()
+                    new_hash = imagehash.average_hash(pyscreenshot.grab(bbox=(x1, y1, x2, y2)))
+                    if not hash1:
+                        self.persistent_auto_signal.emit()
+                        hash1 = new_hash
+                    else:
+                        if hash1 == new_hash:
+                            if changing:
+                                print("changing")
+                                self.persistent_auto_signal.emit()
+                                changing = False
+                        else:
+                            changing = True
+                    hash1 = new_hash
+                    time.sleep(0.5)
+                else:
+                    time.sleep(1)
+
+        def stop(self):
+            self.stop_signal = True
 
 
 class MainHotkeyQObject(QObject):
@@ -1280,16 +1326,16 @@ class OCR:
             pytesseract.pytesseract.tesseract_cmd = path
         if width > height:
             if not self.jpn_api:
-                self.jpn_api = PyTessBaseAPI(lang="jpn", psm=PSM.SINGLE_BLOCK, oem=OEM.LSTM_ONLY)
-            self.api = self.jpn_api
+                # self.jpn_api = PyTessBaseAPI(lang="jpn", psm=PSM.SINGLE_BLOCK)
+                self.jpn_reader = easyocr.Reader(["ja"])
+            text = self.jpn_reader.readtext(numpy.array(image.convert()))
         else:
             if not self.jpn_vert_api:
-                self.jpn_vert_api = PyTessBaseAPI(lang="jpn_vert", psm=PSM.SINGLE_BLOCK_VERT_TEXT, oem=OEM.LSTM_ONLY)
+                self.jpn_vert_api = PyTessBaseAPI(lang="jpn_vert", psm=PSM.SINGLE_BLOCK_VERT_TEXT)
             self.api = self.jpn_vert_api
-
-        assert self.api is not None
-        self.api.SetImage(image)
-        text = self.api.GetUTF8Text().strip()
+            assert self.api is not None
+            self.api.SetImage(image)
+            text = self.api.GetUTF8Text().strip()
 
         for (f, t) in [
             (" ", ""),
