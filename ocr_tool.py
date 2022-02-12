@@ -1,8 +1,8 @@
 from __future__ import annotations
-import easyocr
 import time
 import imagehash  # type: ignore
-from tesserocr import PyTessBaseAPI, PSM, OEM  # type: ignore
+
+# from tesserocr import PyTessBaseAPI, PSM, OEM  # type: ignore
 
 import contextlib
 import signal
@@ -41,12 +41,11 @@ import typer
 from appdirs import user_config_dir
 from easyprocess import EasyProcess  # type: ignore
 from loguru import logger
-from notifypy import Notify  # type: ignore
 from superqt import QLabeledSlider
 from PIL import Image, ImageOps
 from PIL.ImageQt import ImageQt
 from pynput import keyboard  # type: ignore
-from PySide6.QtCore import QBuffer, QObject, QRect, Qt, QThread, Signal, SignalInstance
+from PySide6.QtCore import QBuffer, QObject, QRect, Qt, QThread, Signal, SignalInstance, QMimeData, QUrl, Slot
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -307,42 +306,21 @@ class MainWindow(QWidget):
         show_persistent_window_button = QPushButton("Show Persistent Window")
         show_persistent_window_button.clicked.connect(master_object.show_persistent_screenshot_window)  # type: ignore
 
+        persistent_window_container = QWidget()
+        persistent_window_layout = QHBoxLayout()
+        persistent_window_layout.setContentsMargins(0, 0, 0, 0)
+        persistent_window_container.setLayout(persistent_window_layout)
+
         persistent_window_ocr_button = QPushButton("Persistent Window OCR")
-        persistent_window_ocr_button.setIcon(QIcon("ocr_icon.png"))
         persistent_window_ocr_button.clicked.connect(master_object.take_screenshot_from_persistent_window)  # type: ignore
+        persistent_window_layout.addWidget(persistent_window_ocr_button)
+
+        persistent_window_auto_ocr_button = QPushButton("Auto OCR")
+        persistent_window_auto_ocr_button.clicked.connect(master_object.start_auto_ocr_in_thread)  # type: ignore
+        persistent_window_layout.addWidget(persistent_window_auto_ocr_button)
 
         hotkey_config_button = QPushButton("Configure Hotkeys")
         hotkey_config_button.clicked.connect(self.show_hotkey_config)  # type: ignore
-
-        srs_screenshot_widget = QWidget()
-        srs_screenshot_layout = QHBoxLayout()
-        srs_screenshot_layout.setContentsMargins(0, 0, 0, 0)
-        srs_screenshot_widget.setLayout(srs_screenshot_layout)
-
-        srs_screenshot_checkbox = QCheckBox("SRS Screenshot 🛈")
-        srs_screenshot_checkbox.setChecked(config.config_dict["enable_srs_image"])
-        srs_screenshot_checkbox.setToolTip("A screenshot will be taken that can be added to your SRS cards")
-
-        def srs_screenshot_checkbox_toggl(state):
-            self.config.config_dict["enable_srs_image"] = bool(state == Qt.Checked)
-
-        srs_screenshot_checkbox.stateChanged.connect(srs_screenshot_checkbox_toggl)  # type: ignore
-        self.texthooker_mode_checkbox = QCheckBox("Texthooker mode 🛈")
-        self.texthooker_mode_checkbox.setChecked(config.config_dict["texthooker_mode"])
-
-        def texthooker_mode_checkbox_toggl(state):
-            self.config.config_dict["texthooker_mode"] = bool(state == Qt.Checked)
-            if state == Qt.Checked:
-                self.srs_screenshot.start_texthooker_mode()
-
-        self.texthooker_mode_checkbox.stateChanged.connect(texthooker_mode_checkbox_toggl)  # type: ignore
-        self.texthooker_mode_checkbox.setToolTip("Screenshot is taken automatically on clipboard change")
-
-        srs_screenshot_layout.addWidget(srs_screenshot_checkbox)
-        srs_screenshot_layout.addWidget(self.texthooker_mode_checkbox)
-
-        srs_image_location_button = QPushButton("Set Screenshot location for SRS image")
-        srs_image_location_button.clicked.connect(srs_screenshot.set_srs_image_location)  # type: ignore
 
         ocr_settings_button = QPushButton("OCR Settings")
         ocr_settings_button.clicked.connect(self.show_ocr_settings_window)  # type: ignore
@@ -383,21 +361,65 @@ class MainWindow(QWidget):
         processed_image = master_object.processed_image
         self.image_preview = ImagePreview(processed_image)
 
+        srs_screenshot_widget = QWidget()
+        srs_screenshot_layout = QHBoxLayout()
+        srs_screenshot_layout.setContentsMargins(0, 0, 0, 0)
+        srs_screenshot_widget.setLayout(srs_screenshot_layout)
+
+        srs_screenshot_checkbox = QCheckBox("SRS Screenshot 🛈")
+        srs_screenshot_checkbox.setChecked(config.config_dict["enable_srs_image"])
+        srs_screenshot_checkbox.setToolTip("A screenshot will be taken that can be added to your SRS cards")
+
+        def srs_screenshot_checkbox_toggl(state):
+            self.config.config_dict["enable_srs_image"] = bool(state == Qt.Checked)
+
+        srs_screenshot_checkbox.stateChanged.connect(srs_screenshot_checkbox_toggl)  # type: ignore
+        self.texthooker_mode_checkbox = QCheckBox("Texthooker mode 🛈")
+        self.texthooker_mode_checkbox.setChecked(config.config_dict["texthooker_mode"])
+
+        def texthooker_mode_checkbox_toggl(state):
+            self.config.config_dict["texthooker_mode"] = bool(state == Qt.Checked)
+            if state == Qt.Checked:
+                self.srs_screenshot.start_texthooker_mode()
+
+        self.texthooker_mode_checkbox.stateChanged.connect(texthooker_mode_checkbox_toggl)  # type: ignore
+        self.texthooker_mode_checkbox.setToolTip("Screenshot is taken automatically on clipboard change")
+
+        def copy_screenshot_to_clipboard():
+            im = ImageQt(self.srs_screenshot.image).copy()
+            pixmap = QPixmap.fromImage(im)
+            QApplication.clipboard().setPixmap(pixmap)
+
+        srs_screenshot_to_clipboard_button = QPushButton("Copy screenshot to clipboard")
+        srs_screenshot_to_clipboard_button.clicked.connect(copy_screenshot_to_clipboard)  # type: ignore
+
+        srs_screenshot_layout.addWidget(srs_screenshot_checkbox)
+        srs_screenshot_layout.addWidget(self.texthooker_mode_checkbox)
+        srs_screenshot_layout.addWidget(srs_screenshot_to_clipboard_button)
+
+        srs_image_location_button = QPushButton("Set Screenshot location for SRS image")
+        srs_image_location_button.clicked.connect(srs_screenshot.set_srs_image_location)  # type: ignore
+
         self.recording_checkbox = QCheckBox("Enable Recording")
         self.recording_checkbox.setChecked(config.config_dict["enable_recording"])
         self.recording_checkbox.stateChanged.connect(self.recording_checkbox_toggl)  # type: ignore
 
         save_icon = QApplication.style().standardIcon(QStyle.SP_DialogSaveButton)
 
-        self.audio_save_button = QPushButton("Save Recording and send to Browser Extension")
+        self.audio_save_button = QPushButton("Save Recording")
         self.audio_save_button.setIcon(save_icon)
         self.audio_save_button.clicked.connect(audio_worker.save_audio_and_restart_recording)  # type: ignore
         self.audio_save_button.setEnabled(config.config_dict["enable_recording"])
+
+        self.audio_clipboard_button = QPushButton("Copy last recording to clipboard")
+        self.audio_clipboard_button.clicked.connect(audio_worker.save_last_file_to_clipboard)  # type: ignore
+        self.audio_clipboard_button.setEnabled(config.config_dict["enable_recording"])
 
         recording_layout = QHBoxLayout()
         recording_layout.setContentsMargins(0, 0, 0, 0)
         recording_layout.addWidget(self.recording_checkbox)
         recording_layout.addWidget(self.audio_save_button)
+        recording_layout.addWidget(self.audio_clipboard_button)
         recording_widget = QWidget()
         recording_widget.setLayout(recording_layout)
 
@@ -444,7 +466,7 @@ class MainWindow(QWidget):
         layout = QVBoxLayout()
         layout.addWidget(selection_ocr_button)
         layout.addWidget(show_persistent_window_button)
-        layout.addWidget(persistent_window_ocr_button)
+        layout.addWidget(persistent_window_container)
         layout.addWidget(ocr_settings_button)
         layout.addWidget(self.image_preview)
         layout.addWidget(self.ocr_text_linedit_current)
@@ -495,9 +517,11 @@ class MainWindow(QWidget):
         if state == Qt.Checked:
             self.audio_worker.save_audio_and_restart_recording()
             self.audio_save_button.setEnabled(True)
+            self.audio_clipboard_button.setEnabled(True)
         else:
             self.audio_worker.stop_recording()
             self.audio_save_button.setEnabled(False)
+            self.audio_clipboard_button.setEnabled(False)
 
     def spinbox_valuechange(self):
         self.config.config_dict["recording_seconds"] = self.recording_seconds_spinbox.value()
@@ -564,6 +588,7 @@ class SRSScreenshot:
         self.app = app
         self.config = config
         self.srs_image_location = Rectangle()
+        self.image: Optional[Image.Image] = None
 
     def set_srs_image_location(self):
         QApplication.setOverrideCursor(Qt.CrossCursor)
@@ -601,6 +626,7 @@ class SRSScreenshot:
             )
         )
         if image:
+            self.image = image
             image.save("test.png")
 
     def trigger_srs_screenshot_on_clipboard_change(self):
@@ -999,16 +1025,21 @@ class PersistentWindow(QWidget):
         QApplication.restoreOverrideCursor()
 
     def keyPressEvent(self, event):
-
         if event.key() in [Qt.Key_Return, Qt.Key_Enter]:
-            self.master_object.closed_persistent_window.x1 = self.x()
-            self.master_object.closed_persistent_window.y1 = self.y()
-            self.master_object.closed_persistent_window.x2 = (
-                self.master_object.closed_persistent_window.x1 + self.width()
-            )
-            self.master_object.closed_persistent_window.y2 = (
-                self.master_object.closed_persistent_window.y1 + self.height()
-            )
+            x1 = self.x()
+            y1 = self.y()
+            x2 = x1 + self.width()
+            y2 = y1 + self.height()
+            self.master_object.closed_persistent_window.x1 = x1
+            self.master_object.closed_persistent_window.y1 = y1
+            self.master_object.closed_persistent_window.x2 = x2
+            self.master_object.closed_persistent_window.y2 = y2
+            self.master_object.config.config_dict["persistent_window_location"] = {
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+            }
 
             self.close()
 
@@ -1031,16 +1062,16 @@ class MasterObject:
         self.app.setQuitOnLastWindowClosed(False)
         self.config = Configuration()
         self.srs_screenshot = SRSScreenshot(self.app, self.config)
-        self.audio_worker = AudioWorker(self.config)
+        self.audio_worker = AudioWorker(self.app, self.config)
         self.main_hotkey_qobject = MainHotkeyQObject(self.config, self, self.audio_worker)
         self.ocr = OCR(self)
         self.persistent_window: Optional[PersistentWindow] = None
         self.unprocessed_image: Optional[Image.Image] = None
         self.processed_image: Optional[Image.Image] = None
+        self.update_audio_progress_thread: Optional[MasterObject.AutoOcrThread] = None
         self.closed_persistent_window = Rectangle()
         # this allows for ctrl-c to close the application
         signal.signal(signal.SIGINT, lambda *_: self.app.quit())
-        self.start_audo_ocr_in_thread()
 
         self.setup_tray()
 
@@ -1084,20 +1115,22 @@ class MasterObject:
         QApplication.restoreOverrideCursor()
 
     def show_persistent_screenshot_window(self):
-        if self.closed_persistent_window:
+        x1, y1, x2, y2 = self.get_persistent_window_coordinates()
+        temp_rectangle = Rectangle(x1, y1, x2, y2)
+        if temp_rectangle:
             self.persistent_window = PersistentWindow(
                 self,
-                x=self.closed_persistent_window.x1,
-                y=self.closed_persistent_window.y1,
-                w=self.closed_persistent_window.get_width(),
-                h=self.closed_persistent_window.get_height(),
+                x=temp_rectangle.x1,
+                y=temp_rectangle.y1,
+                w=temp_rectangle.get_width(),
+                h=temp_rectangle.get_height(),
             )
         else:
             self.persistent_window = PersistentWindow(self)
         self.persistent_window.show()
 
     def get_persistent_window_coordinates(self) -> tuple[float, float, float, float]:
-        if self.persistent_window:
+        if self.persistent_window and not self.persistent_window.isHidden():
             x1 = self.persistent_window.x()
             y1 = self.persistent_window.y()
             x2 = x1 + self.persistent_window.width()
@@ -1107,17 +1140,25 @@ class MasterObject:
             y1 = self.closed_persistent_window.y1
             x2 = self.closed_persistent_window.x2
             y2 = self.closed_persistent_window.y2
+        elif self.config.config_dict.get("persistent_window_location", None):
+            x1 = self.config.config_dict.get("persistent_window_location", {}).get("x1", 0)
+            y1 = self.config.config_dict.get("persistent_window_location", {}).get("y1", 0)
+            x2 = self.config.config_dict.get("persistent_window_location", {}).get("x2", 0)
+            y2 = self.config.config_dict.get("persistent_window_location", {}).get("y2", 0)
         else:
             x1 = 0
             y1 = 0
             x2 = 0
             y2 = 0
+
         return (x1, y1, x2, y2)
 
     def take_screenshot_from_persistent_window(self):
         self.srs_screenshot.take_srs_screenshot_in_thread()
         persistent_window = self.persistent_window
-        if not persistent_window and not self.closed_persistent_window:
+        x1, y1, x2, y2 = self.get_persistent_window_coordinates()
+        temp_rectangle = Rectangle(x1, y1, x2, y2)
+        if not temp_rectangle:
             logger.warning("persistent window not initialized yet or persistent_window location not saved")
         else:
             x1, y1, x2, y2 = self.get_persistent_window_coordinates()
@@ -1135,7 +1176,10 @@ class MasterObject:
 
             self.ocr.start_ocr_in_thread(image)
 
-    def start_audo_ocr_in_thread(self):
+    def start_auto_ocr_in_thread(self):
+        if self.update_audio_progress_thread:
+            self.update_audio_progress_thread.stop_signal = True
+            self.update_audio_progress_thread.wait()
         self.update_audio_progress_thread = MasterObject.AutoOcrThread(self)
         self.update_audio_progress_thread.persistent_auto_signal.connect(self.take_screenshot_from_persistent_window)
         self.update_audio_progress_thread.start()
@@ -1152,8 +1196,9 @@ class MasterObject:
             hash1 = None
             changing = False
             while not self.stop_signal:
-                if self.master_object.persistent_window or self.master_object.closed_persistent_window:
-                    x1, y1, x2, y2 = self.master_object.get_persistent_window_coordinates()
+                x1, y1, x2, y2 = self.master_object.get_persistent_window_coordinates()
+                temp_rectangle = Rectangle(x1, y1, x2, y2)
+                if temp_rectangle:
                     new_hash = imagehash.average_hash(pyscreenshot.grab(bbox=(x1, y1, x2, y2)))
                     if not hash1:
                         self.persistent_auto_signal.emit()
@@ -1161,13 +1206,12 @@ class MasterObject:
                     else:
                         if hash1 == new_hash:
                             if changing:
-                                print("changing")
                                 self.persistent_auto_signal.emit()
                                 changing = False
                         else:
                             changing = True
                     hash1 = new_hash
-                    time.sleep(0.5)
+                    time.sleep(0.3)
                 else:
                     time.sleep(1)
 
@@ -1277,8 +1321,9 @@ class OCR:
 
         override_options: list[dict[str, Any]] = [
             {},
-            {"ocr_settings": {"thresholding_algorithm": "NICK"}},
-            {"ocr_settings": {"thresholding_algorithm": "WAN"}},
+            {"ocr_settings": {"automatic_thresholding": True, "thresholding_algorithm": "OTSU"}},
+            {"ocr_settings": {"automatic_thresholding": True, "thresholding_algorithm": "NICK"}},
+            {"ocr_settings": {"automatic_thresholding": True, "thresholding_algorithm": "WAN"}},
             {"invert_color": True},
         ]
         if skip_override:
@@ -1319,23 +1364,59 @@ class OCR:
             return True
         return any(char.lower() in config.config_dict["ocr_settings"]["character_blacklist"] for char in text)
 
+    # def do_ocr(self, image: Image.Image):
+    #     width, height = image.size
+    #     if platform.system() == "Windows":
+    #         path = os.path.abspath("tesseract/tesseract.exe")
+    #         pytesseract.pytesseract.tesseract_cmd = path
+    #     if width > height:
+    #         if not self.jpn_api:
+    #             self.jpn_api = PyTessBaseAPI(lang="jpn", psm=PSM.SINGLE_BLOCK, oem=OEM.LSTM_ONLY)
+    #         self.api = self.jpn_api
+    #     else:
+    #         if not self.jpn_vert_api:
+    #             self.jpn_vert_api = PyTessBaseAPI(lang="jpn_vert", psm=PSM.SINGLE_BLOCK_VERT_TEXT, oem=OEM.LSTM_ONLY)
+    #         self.api = self.jpn_vert_api
+    #     # def do_ocr(self, image: Image.Image):
+    #     #     width, height = image.size
+    #     #     if platform.system() == "Windows":
+    #     #         path = os.path.abspath("tesseract/tesseract.exe")
+    #     #         pytesseract.pytesseract.tesseract_cmd = path
+    #     #     if width > height:
+    #     #         if not self.jpn_api:
+    #     #             # self.jpn_api = PyTessBaseAPI(lang="jpn", psm=PSM.SINGLE_BLOCK)
+    #     #             self.jpn_reader = easyocr.Reader(["ja"])
+    #     #         text = self.jpn_reader.readtext(numpy.array(image.convert()))
+    #     #     else:
+    #     #         if not self.jpn_vert_api:
+    #     #             self.jpn_vert_api = PyTessBaseAPI(lang="jpn_vert", psm=PSM.SINGLE_BLOCK_VERT_TEXT)
+    #     #         self.api = self.jpn_vert_api
+    #     #         assert self.api is not None
+    #     #         self.api.setimage(image)
+    #     #         text = self.api.getutf8text().strip()
+    #
+    #     assert self.api is not None
+    #     self.api.SetImage(image)
+    #     text = self.api.GetUTF8Text().strip()
+
     def do_ocr(self, image: Image.Image):
         width, height = image.size
+        language = ""
+        path = ""
         if platform.system() == "Windows":
             path = os.path.abspath("tesseract/tesseract.exe")
             pytesseract.pytesseract.tesseract_cmd = path
+        # else:
+        #     path = "/home/julius/Projects/tesseract/tesseract/tesseract"
+        #     pytesseract.pytesseract.tesseract_cmd = path
         if width > height:
-            if not self.jpn_api:
-                # self.jpn_api = PyTessBaseAPI(lang="jpn", psm=PSM.SINGLE_BLOCK)
-                self.jpn_reader = easyocr.Reader(["ja"])
-            text = self.jpn_reader.readtext(numpy.array(image.convert()))
+            language = "jpn"
+            tesseract_config = "--oem 1 --psm 6"
         else:
-            if not self.jpn_vert_api:
-                self.jpn_vert_api = PyTessBaseAPI(lang="jpn_vert", psm=PSM.SINGLE_BLOCK_VERT_TEXT)
-            self.api = self.jpn_vert_api
-            assert self.api is not None
-            self.api.SetImage(image)
-            text = self.api.GetUTF8Text().strip()
+            language = "jpn_vert"
+            tesseract_config = "--oem 1 --psm 5"
+        text = pytesseract.image_to_string(image, lang=language, config=tesseract_config)
+        text = text.strip()
 
         for (f, t) in [
             (" ", ""),
@@ -1492,17 +1573,6 @@ class ImageProcessor:
 def process_text(text: str):
     if text:
         pyperclip.copy(text)
-        with ThreadPoolExecutor() as executor:
-            hiragana_thread = executor.submit(convert_to_hiragana, text)
-            hiragana = hiragana_thread.result(7)
-
-            final_text = f"{hiragana}"
-
-            notification = Notify()
-            notification.title = text
-            notification.message = final_text
-            notification.icon = ""
-            notification.send(block=False)
 
 
 def capture_desktop(app: QApplication):
@@ -1587,7 +1657,8 @@ def convert_to_hiragana(text):
 
 
 class AudioWorker:
-    def __init__(self, config: Configuration):
+    def __init__(self, app: QApplication, config: Configuration):
+        self.app = app
         self.config = config
         self.audio_recorder_thread: Optional[AudioWorker.AudioRecorderThread] = None
         self.audio_processing_thread: Optional[AudioWorker.AudioProcessorThread] = None
@@ -1600,7 +1671,9 @@ class AudioWorker:
         if self.audio_recorder_thread:
             self.stop_recording()
         self.audio_recorder_thread = AudioWorker.AudioRecorderThread(self.config, self)
-        self.audio_recorder_thread.completed.connect(self._process_audio)
+        # TODO signal is not getting emitted/received 😭
+        self.audio_recorder_thread.done_signal.connect(self._process_audio)
+        self.audio_recorder_thread.finished.connect(lambda: print("test"))
         self.audio_recorder_thread.start()
 
     def stop_recording(self) -> None:
@@ -1608,14 +1681,25 @@ class AudioWorker:
             self.audio_recorder_thread.stop_recording = True
             self.audio_recorder_thread.wait()
 
-    def _process_audio(self, audio_deque):
+    @Slot(deque)
+    def _process_audio(self, audio_deque: deque):
+        print("got finish signal")
         if self.audio_processing_thread:
             self.audio_processing_thread.wait()
         self.audio_processing_thread = AudioWorker.AudioProcessorThread(audio_deque)
         self.audio_processing_thread.start()
 
+    def save_last_file_to_clipboard(self):
+
+        data = QMimeData()
+        url = QUrl.fromLocalFile(os.path.abspath("test.mp3"))
+        data.setUrls([url])
+
+        self.app.clipboard().setMimeData(data)
+
     class AudioRecorderThread(QThread):
-        completed = cast(SignalInstance, Signal(deque))
+        done_signal = cast(SignalInstance, Signal(deque))
+        another_signal = cast(SignalInstance, Signal())
 
         def __init__(self, config: Configuration, audio_worker: AudioWorker) -> None:
             QThread.__init__(self)
@@ -1624,11 +1708,8 @@ class AudioWorker:
             self.audio_worker = audio_worker
 
         def run(self):
-            self._record_audio()
-
-        def _record_audio(self) -> None:
             logger.debug("Starting audio recording")
-            samplerate = 48000
+            samplerate = 6000
             global selected_mic
             loopback = selected_mic
             if not loopback:
@@ -1645,7 +1726,10 @@ class AudioWorker:
                     audio_deque.append(data)
                     if len(audio_deque) > self.config.config_dict["recording_seconds"]:
                         audio_deque.popleft()
-            self.completed.emit(audio_deque)
+            self.done_signal.emit(audio_deque)
+            print("emitting completed signal")
+            self.another_signal.emit()
+            print("emitting another")
 
     class AudioProcessorThread(QThread):
         def __init__(self, audio_deque):
