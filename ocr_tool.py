@@ -30,9 +30,7 @@ from tempfile import NamedTemporaryFile
 from typing import Any, Optional, cast
 
 import numpy
-import pykakasi
 import pyperclip  # type: ignore
-import pyscreenshot  # type: ignore
 import pytesseract  # type: ignore
 import soundcard  # type: ignore
 import tomli
@@ -42,7 +40,7 @@ from appdirs import user_config_dir
 from easyprocess import EasyProcess  # type: ignore
 from loguru import logger
 from superqt import QLabeledSlider
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageGrab
 from PIL.ImageQt import ImageQt
 from pynput import keyboard  # type: ignore
 from PySide6.QtCore import QBuffer, QObject, QRect, Qt, QThread, Signal, SignalInstance, QMimeData, QUrl, Slot
@@ -80,6 +78,7 @@ from PySide6.QtWidgets import (
 from scipy.io import wavfile  # type: ignore
 
 ffmpeg_command: Optional[str] = ""
+tesseract_command: Optional[str] = ""
 
 
 def resource_path(relative_path):
@@ -88,19 +87,23 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 
-if os.path.isfile(resource_path("./ffmpeg")):
-    ffmpeg_command = resource_path("./ffmpeg")
 if platform.system() == "Windows":
-    ffmpeg_command = "ffmpeg.exe"
+    if os.path.isfile(resource_path("ffmpeg.exe")):
+        ffmpeg_command = resource_path("ffmpeg.exe")
+    if os.path.isfile(resource_path("./tesseract/tesseract.exe")):
+        tesseract_command = resource_path("./tesseract/tesseract.exe")
+    elif os.path.isfile(resource_path("./Game2Text/resources/bin/win/tesseract/tesseract.exe")):
+        tesseract_command = resource_path("./Game2Text/resources/bin/win/tesseract/tesseract.exe")
+    if not tesseract_command:
+        tesseract_command = which("tesseract.exe")
+elif os.path.isfile(resource_path("./ffmpeg")):
+    ffmpeg_command = resource_path("./ffmpeg")
 
+if not tesseract_command:
+    tesseract_command = which("tesseract.exe")
 
 if not ffmpeg_command:
     ffmpeg_command = which("ffmpeg")
-
-missing_program = ""
-if not ffmpeg_command:
-    missing_program = "ffmpeg"
-
 
 selected_mic = None
 
@@ -162,7 +165,7 @@ class Configuration:
                 "thresholding_algorithm": "OTSU",
                 "smart_image_inversion": True,
                 "add_border": True,
-                "character_blacklist": "abcdefghijklmnopqrstuvwxyzüöä",
+                "character_blacklist": "",
             },
         }
         self.config_dict: dict[str, Any]
@@ -316,7 +319,7 @@ class MainWindow(QWidget):
         persistent_window_layout.addWidget(persistent_window_ocr_button)
 
         persistent_window_auto_ocr_button = QPushButton("Auto OCR")
-        persistent_window_auto_ocr_button.clicked.connect(master_object.start_auto_ocr_in_thread)  # type: ignore
+        persistent_window_auto_ocr_button.clicked.connect(self.toggle_auto_ocr)  # type: ignore
         persistent_window_layout.addWidget(persistent_window_auto_ocr_button)
 
         hotkey_config_button = QPushButton("Configure Hotkeys")
@@ -386,9 +389,10 @@ class MainWindow(QWidget):
         self.texthooker_mode_checkbox.setToolTip("Screenshot is taken automatically on clipboard change")
 
         def copy_screenshot_to_clipboard():
-            im = ImageQt(self.srs_screenshot.image).copy()
-            pixmap = QPixmap.fromImage(im)
-            QApplication.clipboard().setPixmap(pixmap)
+            if self.srs_screenshot.image:
+                im = ImageQt(self.srs_screenshot.image).copy()
+                print(type(im))
+                QApplication.clipboard().setImage(im)
 
         srs_screenshot_to_clipboard_button = QPushButton("Copy screenshot to clipboard")
         srs_screenshot_to_clipboard_button.clicked.connect(copy_screenshot_to_clipboard)  # type: ignore
@@ -436,7 +440,10 @@ class MainWindow(QWidget):
         recording_seconds_widget = QWidget()
         recording_seconds_widget.setLayout(recording_seconds_layout)
 
-        self.mics = soundcard.all_microphones(include_loopback=True)
+        try:
+            self.mics = soundcard.all_microphones(include_loopback=True)
+        except RuntimeError:
+            self.mics = []
         mic_names = [mic.name for mic in self.mics]
         self.mic_combobox = QComboBox()
         self.mic_combobox.addItems(mic_names)
@@ -444,7 +451,11 @@ class MainWindow(QWidget):
         if loopback:
             self.mic_combobox.setCurrentText(loopback.name)
         global selected_mic
-        selected_mic = next(x for x in self.mics if x.name == self.mic_combobox.currentText())
+        try:
+            selected_mic = next(x for x in self.mics if x.name == self.mic_combobox.currentText())
+        except (RuntimeError, StopIteration):
+            selected_mic = None
+
         self.mic_combobox.activated.connect(self.mic_selection_change)  # type: ignore
 
         if config.config_dict["enable_recording"]:
@@ -483,6 +494,13 @@ class MainWindow(QWidget):
         layout.addWidget(self.audio_peak_progressbar)
         layout.addWidget(save_settings_button)
         self.setLayout(layout)
+
+    def toggle_auto_ocr(self):
+        if self.master_object.auto_ocr_thread:
+            self.master_object.auto_ocr_thread.stop_signal = True
+            self.master_object.auto_ocr_thread.wait()
+        else:
+            self.master_object.start_auto_ocr_in_thread()
 
     def algorithm_change(self):
         self.config.config_dict["ocr_settings"]["thresholding_algorithm"] = self.algorithm_combobox.currentText()
@@ -546,7 +564,7 @@ class MainWindow(QWidget):
             global selected_mic
             loopback = selected_mic
             if not loopback:
-                raise RuntimeError("No audio device set")
+                return
             with loopback.recorder(samplerate=samplerate) as rec:
                 while not self.stop_signal:
                     data: numpy.ndarray
@@ -617,13 +635,13 @@ class SRSScreenshot:
             self.srs_image_location.x2 = size.width()
             self.srs_image_location.y2 = size.height()
 
-        image = pyscreenshot.grab(
+        image = ImageGrab.grab(
             bbox=(
-                self.srs_image_location.x1,
-                self.srs_image_location.y1,
-                self.srs_image_location.x2,
-                self.srs_image_location.y2,
-            )
+                int(self.srs_image_location.x1),
+                int(self.srs_image_location.y1),
+                int(self.srs_image_location.x2),
+                int(self.srs_image_location.y2),
+            ),
         )
         if image:
             self.image = image
@@ -1068,7 +1086,8 @@ class MasterObject:
         self.persistent_window: Optional[PersistentWindow] = None
         self.unprocessed_image: Optional[Image.Image] = None
         self.processed_image: Optional[Image.Image] = None
-        self.update_audio_progress_thread: Optional[MasterObject.AutoOcrThread] = None
+        self.update_audio_progress_thread: Optional[MainWindow.UpdateAudioProgressThread] = None
+        self.auto_ocr_thread: Optional[MasterObject.AutoOcrThread] = None
         self.closed_persistent_window = Rectangle()
         # this allows for ctrl-c to close the application
         signal.signal(signal.SIGINT, lambda *_: self.app.quit())
@@ -1129,7 +1148,7 @@ class MasterObject:
             self.persistent_window = PersistentWindow(self)
         self.persistent_window.show()
 
-    def get_persistent_window_coordinates(self) -> tuple[float, float, float, float]:
+    def get_persistent_window_coordinates(self) -> tuple[int, int, int, int]:
         if self.persistent_window and not self.persistent_window.isHidden():
             x1 = self.persistent_window.x()
             y1 = self.persistent_window.y()
@@ -1151,7 +1170,7 @@ class MasterObject:
             x2 = 0
             y2 = 0
 
-        return (x1, y1, x2, y2)
+        return (int(x1), int(y1), int(x2), int(y2))
 
     def take_screenshot_from_persistent_window(self):
         self.srs_screenshot.take_srs_screenshot_in_thread()
@@ -1162,7 +1181,7 @@ class MasterObject:
             logger.warning("persistent window not initialized yet or persistent_window location not saved")
         else:
             x1, y1, x2, y2 = self.get_persistent_window_coordinates()
-            image = pyscreenshot.grab(bbox=(x1, y1, x2, y2))
+            image = ImageGrab.grab(bbox=(x1, y1, x2, y2))
             if image and persistent_window and persistent_window.ocrButton.isVisible():
                 button = persistent_window.ocrButton
                 x1 = button.x()
@@ -1177,12 +1196,9 @@ class MasterObject:
             self.ocr.start_ocr_in_thread(image)
 
     def start_auto_ocr_in_thread(self):
-        if self.update_audio_progress_thread:
-            self.update_audio_progress_thread.stop_signal = True
-            self.update_audio_progress_thread.wait()
-        self.update_audio_progress_thread = MasterObject.AutoOcrThread(self)
-        self.update_audio_progress_thread.persistent_auto_signal.connect(self.take_screenshot_from_persistent_window)
-        self.update_audio_progress_thread.start()
+        self.auto_ocr_thread = MasterObject.AutoOcrThread(self)
+        self.auto_ocr_thread.persistent_auto_signal.connect(self.take_screenshot_from_persistent_window)
+        self.auto_ocr_thread.start()
 
     class AutoOcrThread(QThread):
         persistent_auto_signal = cast(SignalInstance, Signal())
@@ -1199,7 +1215,7 @@ class MasterObject:
                 x1, y1, x2, y2 = self.master_object.get_persistent_window_coordinates()
                 temp_rectangle = Rectangle(x1, y1, x2, y2)
                 if temp_rectangle:
-                    new_hash = imagehash.average_hash(pyscreenshot.grab(bbox=(x1, y1, x2, y2)))
+                    new_hash = imagehash.average_hash(ImageGrab.grab(bbox=(x1, y1, x2, y2)))
                     if not hash1:
                         self.persistent_auto_signal.emit()
                         hash1 = new_hash
@@ -1364,47 +1380,12 @@ class OCR:
             return True
         return any(char.lower() in config.config_dict["ocr_settings"]["character_blacklist"] for char in text)
 
-    # def do_ocr(self, image: Image.Image):
-    #     width, height = image.size
-    #     if platform.system() == "Windows":
-    #         path = os.path.abspath("tesseract/tesseract.exe")
-    #         pytesseract.pytesseract.tesseract_cmd = path
-    #     if width > height:
-    #         if not self.jpn_api:
-    #             self.jpn_api = PyTessBaseAPI(lang="jpn", psm=PSM.SINGLE_BLOCK, oem=OEM.LSTM_ONLY)
-    #         self.api = self.jpn_api
-    #     else:
-    #         if not self.jpn_vert_api:
-    #             self.jpn_vert_api = PyTessBaseAPI(lang="jpn_vert", psm=PSM.SINGLE_BLOCK_VERT_TEXT, oem=OEM.LSTM_ONLY)
-    #         self.api = self.jpn_vert_api
-    #     # def do_ocr(self, image: Image.Image):
-    #     #     width, height = image.size
-    #     #     if platform.system() == "Windows":
-    #     #         path = os.path.abspath("tesseract/tesseract.exe")
-    #     #         pytesseract.pytesseract.tesseract_cmd = path
-    #     #     if width > height:
-    #     #         if not self.jpn_api:
-    #     #             # self.jpn_api = PyTessBaseAPI(lang="jpn", psm=PSM.SINGLE_BLOCK)
-    #     #             self.jpn_reader = easyocr.Reader(["ja"])
-    #     #         text = self.jpn_reader.readtext(numpy.array(image.convert()))
-    #     #     else:
-    #     #         if not self.jpn_vert_api:
-    #     #             self.jpn_vert_api = PyTessBaseAPI(lang="jpn_vert", psm=PSM.SINGLE_BLOCK_VERT_TEXT)
-    #     #         self.api = self.jpn_vert_api
-    #     #         assert self.api is not None
-    #     #         self.api.setimage(image)
-    #     #         text = self.api.getutf8text().strip()
-    #
-    #     assert self.api is not None
-    #     self.api.SetImage(image)
-    #     text = self.api.GetUTF8Text().strip()
-
     def do_ocr(self, image: Image.Image):
         width, height = image.size
         language = ""
         path = ""
         if platform.system() == "Windows":
-            path = os.path.abspath("tesseract/tesseract.exe")
+            path = os.path.abspath(tesseract_command)
             pytesseract.pytesseract.tesseract_cmd = path
         # else:
         #     path = "/home/julius/Projects/tesseract/tesseract/tesseract"
@@ -1572,6 +1553,7 @@ class ImageProcessor:
 
 def process_text(text: str):
     if text:
+        pass
         pyperclip.copy(text)
 
 
@@ -1647,47 +1629,45 @@ def convert_qpixmap_to_pil_image(pixmap: QPixmap):
     return Image.open(io.BytesIO(buffer.data()))  # type: ignore
 
 
-def convert_to_hiragana(text):
-    kks = pykakasi.kakasi()
-    result = kks.convert(text)
-    result_str = ""
-    for item in result:
-        result_str += item["hira"]
-    return result_str
-
-
 class AudioWorker:
     def __init__(self, app: QApplication, config: Configuration):
         self.app = app
         self.config = config
-        self.audio_recorder_thread: Optional[AudioWorker.AudioRecorderThread] = None
-        self.audio_processing_thread: Optional[AudioWorker.AudioProcessorThread] = None
+        self.audio_recorder_threads: list[AudioWorker.AudioRecorderThread] = []
+        self.audio_processing_threads: list[AudioWorker.AudioProcessorThread] = []
 
     def save_audio_and_restart_recording(self):
         self.stop_recording()
         self._start_recording()
 
+    def clean_up_finished_audio_recorder_threads(self):
+        for thread in self.audio_recorder_threads:
+            if thread.isFinished():
+                self.audio_recorder_threads.remove(thread)
+
+    def clean_up_finished_audio_processing_threads(self):
+        for thread in self.audio_processing_threads:
+            if thread.isFinished():
+                self.audio_processing_threads.remove(thread)
+
     def _start_recording(self):
-        if self.audio_recorder_thread:
-            self.stop_recording()
-        self.audio_recorder_thread = AudioWorker.AudioRecorderThread(self.config, self)
-        # TODO signal is not getting emitted/received 😭
-        self.audio_recorder_thread.done_signal.connect(self._process_audio)
-        self.audio_recorder_thread.finished.connect(lambda: print("test"))
-        self.audio_recorder_thread.start()
+        audio_recorder_thread = AudioWorker.AudioRecorderThread(self.config, self)
+        self.audio_recorder_threads.append(audio_recorder_thread)
+        audio_recorder_thread.done_signal.connect(self._process_audio)
+        audio_recorder_thread.finished.connect(self.clean_up_finished_audio_recorder_threads)
+        audio_recorder_thread.start()
 
     def stop_recording(self) -> None:
-        if self.audio_recorder_thread:
-            self.audio_recorder_thread.stop_recording = True
-            self.audio_recorder_thread.wait()
+        for thread in self.audio_recorder_threads:
+            thread.stop_recording = True
 
     @Slot(deque)
     def _process_audio(self, audio_deque: deque):
         print("got finish signal")
-        if self.audio_processing_thread:
-            self.audio_processing_thread.wait()
-        self.audio_processing_thread = AudioWorker.AudioProcessorThread(audio_deque)
-        self.audio_processing_thread.start()
+        audio_processing_thread = AudioWorker.AudioProcessorThread(audio_deque)
+        audio_processing_thread.finished.connect(self.clean_up_finished_audio_processing_threads)
+        self.audio_processing_threads.append(audio_processing_thread)
+        audio_processing_thread.start()
 
     def save_last_file_to_clipboard(self):
 
@@ -1699,7 +1679,6 @@ class AudioWorker:
 
     class AudioRecorderThread(QThread):
         done_signal = cast(SignalInstance, Signal(deque))
-        another_signal = cast(SignalInstance, Signal())
 
         def __init__(self, config: Configuration, audio_worker: AudioWorker) -> None:
             QThread.__init__(self)
@@ -1709,7 +1688,7 @@ class AudioWorker:
 
         def run(self):
             logger.debug("Starting audio recording")
-            samplerate = 6000
+            samplerate = 48000
             global selected_mic
             loopback = selected_mic
             if not loopback:
@@ -1728,8 +1707,6 @@ class AudioWorker:
                         audio_deque.popleft()
             self.done_signal.emit(audio_deque)
             print("emitting completed signal")
-            self.another_signal.emit()
-            print("emitting another")
 
     class AudioProcessorThread(QThread):
         def __init__(self, audio_deque):
@@ -1782,11 +1759,15 @@ class AudioWorker:
                         cmd = ["ffmpeg", "-y", "-i", temp_wav_file.name, temp_mp3_file.name]
                         EasyProcess(cmd).call(timeout=40)
                         # uncomment below for testing
+                        shutil.copyfile(temp_wav_file.name, "test.wav")
                         shutil.copyfile(temp_mp3_file.name, "test.mp3")
 
 
 def get_loopback_device(mics):
-    default_speaker = soundcard.default_speaker()
+    try:
+        default_speaker = soundcard.default_speaker()
+    except RuntimeError:
+        return None
     loopback = None
 
     def get_loopback(mics, default_speaker):

@@ -17,10 +17,13 @@ Vagrant.configure("2") do |config|
     inline: "Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))",
     privileged: true
   config.vm.provision "shell",
-    inline: "choco install python -y",
+    inline: "choco install python --version=3.9.7 -y",
     privileged: true
   config.vm.provision "shell",
     inline: "pip install poetry",
+    privileged: true
+  config.vm.provision "shell",
+    inline: "choco install git -y",
     privileged: true
   # Disable automatic box update checking. If you disable this, then
   # boxes will only be checked for updates when the user runs

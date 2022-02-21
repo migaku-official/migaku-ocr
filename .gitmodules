@@ -1,0 +1,3 @@
+[submodule "Game2Text"]
+	path = Game2Text
+	url = https://github.com/mathewthe2/Game2Text.git
