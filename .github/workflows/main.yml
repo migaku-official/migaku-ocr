@@ -81,7 +81,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v2
-      - run: choco uninstall python -y
       - run: choco install python --version=3.9.7 -y
       - run: pipx install poetry
       # - run: choco install visualstudio2019-workload-vctools -y
