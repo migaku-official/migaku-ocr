@@ -1461,7 +1461,12 @@ class ImageProcessor:
         diff = 0
         for x in range(width):
             for y in range(height):
-                r, g, b = pixels[x, y]
+                if len(pixels[x, y]) == 3:
+                    r, g, b = pixels[x, y]
+                elif len(pixels[x, y]) == 4:
+                    r, g, b, _ = pixels[x, y]
+                else:
+                    return False
                 rg = abs(r - g)
                 rb = abs(r - b)
                 gb = abs(g - b)
