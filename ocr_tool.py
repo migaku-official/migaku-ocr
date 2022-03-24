@@ -156,6 +156,7 @@ class Configuration:
             "enable_global_hotkeys": False,
             "texthooker_mode": False,
             "enable_recording": False,
+            "auto_save_recording": False,
             "recording_seconds": 20,
             "enable_srs_image": True,
             "ocr_settings": {
@@ -364,10 +365,10 @@ class MainWindow(QWidget):
         processed_image = master_object.processed_image
         self.image_preview = ImagePreview(processed_image)
 
-        srs_screenshot_widget = QWidget()
-        srs_screenshot_layout = QHBoxLayout()
-        srs_screenshot_layout.setContentsMargins(0, 0, 0, 0)
-        srs_screenshot_widget.setLayout(srs_screenshot_layout)
+        srs_screenshot_widget1 = QWidget()
+        srs_screenshot_layout1 = QHBoxLayout()
+        srs_screenshot_layout1.setContentsMargins(0, 0, 0, 0)
+        srs_screenshot_widget1.setLayout(srs_screenshot_layout1)
 
         srs_screenshot_checkbox = QCheckBox("SRS Screenshot 🛈")
         srs_screenshot_checkbox.setChecked(config.config_dict["enable_srs_image"])
@@ -388,25 +389,38 @@ class MainWindow(QWidget):
         self.texthooker_mode_checkbox.stateChanged.connect(texthooker_mode_checkbox_toggl)  # type: ignore
         self.texthooker_mode_checkbox.setToolTip("Screenshot is taken automatically on clipboard change")
 
+        srs_screenshot_widget2 = QWidget()
+        srs_screenshot_layout2 = QHBoxLayout()
+        srs_screenshot_layout2.setContentsMargins(0, 0, 0, 0)
+        srs_screenshot_widget2.setLayout(srs_screenshot_layout2)
+
+        manual_srs_screenshot_button = QPushButton("Manual SRS Screenshot")
+        manual_srs_screenshot_button.clicked.connect(self.srs_screenshot.take_srs_screenshot)  # type: ignore
+        srs_screenshot_layout2.addWidget(manual_srs_screenshot_button)
+
         def copy_screenshot_to_clipboard():
             if self.srs_screenshot.image:
                 im = ImageQt(self.srs_screenshot.image).copy()
                 print(type(im))
                 QApplication.clipboard().setImage(im)
 
-        srs_screenshot_to_clipboard_button = QPushButton("Copy screenshot to clipboard")
+        srs_screenshot_to_clipboard_button = QPushButton("Copy Screenshot to Clipboard")
         srs_screenshot_to_clipboard_button.clicked.connect(copy_screenshot_to_clipboard)  # type: ignore
+        srs_screenshot_layout2.addWidget(srs_screenshot_to_clipboard_button)
 
-        srs_screenshot_layout.addWidget(srs_screenshot_checkbox)
-        srs_screenshot_layout.addWidget(self.texthooker_mode_checkbox)
-        srs_screenshot_layout.addWidget(srs_screenshot_to_clipboard_button)
+        srs_screenshot_layout1.addWidget(srs_screenshot_checkbox)
+        srs_screenshot_layout1.addWidget(self.texthooker_mode_checkbox)
 
-        srs_image_location_button = QPushButton("Set Screenshot location for SRS image")
+        srs_image_location_button = QPushButton("Set Screenshot Location for SRS Image")
         srs_image_location_button.clicked.connect(srs_screenshot.set_srs_image_location)  # type: ignore
 
         self.recording_checkbox = QCheckBox("Enable Recording")
         self.recording_checkbox.setChecked(config.config_dict["enable_recording"])
         self.recording_checkbox.stateChanged.connect(self.recording_checkbox_toggl)  # type: ignore
+
+        self.auto_save_recording_checkbox = QCheckBox("Save Recording on OCR")
+        self.auto_save_recording_checkbox.setChecked(config.config_dict["auto_save_recording"])
+        self.auto_save_recording_checkbox.stateChanged.connect(self.auto_save_recording_checkbox_toggl)  # type: ignore
 
         save_icon = QApplication.style().standardIcon(QStyle.SP_DialogSaveButton)
 
@@ -419,13 +433,19 @@ class MainWindow(QWidget):
         self.audio_clipboard_button.clicked.connect(audio_worker.save_last_file_to_clipboard)  # type: ignore
         self.audio_clipboard_button.setEnabled(config.config_dict["enable_recording"])
 
-        recording_layout = QHBoxLayout()
-        recording_layout.setContentsMargins(0, 0, 0, 0)
-        recording_layout.addWidget(self.recording_checkbox)
-        recording_layout.addWidget(self.audio_save_button)
-        recording_layout.addWidget(self.audio_clipboard_button)
-        recording_widget = QWidget()
-        recording_widget.setLayout(recording_layout)
+        recording_layout1 = QHBoxLayout()
+        recording_layout1.setContentsMargins(0, 0, 0, 0)
+        recording_layout1.addWidget(self.recording_checkbox)
+        recording_layout1.addWidget(self.auto_save_recording_checkbox)
+        recording_widget1 = QWidget()
+        recording_widget1.setLayout(recording_layout1)
+
+        recording_layout2 = QHBoxLayout()
+        recording_layout2.setContentsMargins(0, 0, 0, 0)
+        recording_layout2.addWidget(self.audio_save_button)
+        recording_layout2.addWidget(self.audio_clipboard_button)
+        recording_widget2 = QWidget()
+        recording_widget2.setLayout(recording_layout2)
 
         recording_seconds_label = QLabel("Seconds to continuously record:")
         self.recording_seconds_spinbox = QSpinBox()
@@ -486,9 +506,11 @@ class MainWindow(QWidget):
         layout.addWidget(self.algorithm_combobox)
         layout.addWidget(self.thresholding_slider)
         layout.addWidget(hotkey_config_button)
-        layout.addWidget(srs_screenshot_widget)
+        layout.addWidget(srs_screenshot_widget1)
+        layout.addWidget(srs_screenshot_widget2)
         layout.addWidget(srs_image_location_button)
-        layout.addWidget(recording_widget)
+        layout.addWidget(recording_widget1)
+        layout.addWidget(recording_widget2)
         layout.addWidget(recording_seconds_widget)
         layout.addWidget(self.mic_combobox)
         layout.addWidget(self.audio_peak_progressbar)
@@ -530,8 +552,11 @@ class MainWindow(QWidget):
     def update_volume_progressbar(self, volume: int):
         self.audio_peak_progressbar.setValue(volume)
 
+    def auto_save_recording_checkbox_toggl(self, state):
+        self.config.config_dict["auto_save_recording"] = state == Qt.Checked
+
     def recording_checkbox_toggl(self, state):
-        self.config.config_dict["enable_recording"] = bool(state == Qt.Checked)
+        self.config.config_dict["enable_recording"] = state == Qt.Checked
         if state == Qt.Checked:
             self.audio_worker.save_audio_and_restart_recording()
             self.audio_save_button.setEnabled(True)
@@ -644,8 +669,12 @@ class SRSScreenshot:
             ),
         )
         if image:
-            self.image = image
-            image.save("test.png")
+            MAX_SIZE = (848, 480)
+            image.thumbnail(MAX_SIZE)
+            with NamedTemporaryFile(suffix=".webp", delete=False) as temp_webp_file:
+                image.save(temp_webp_file.name, optimize=True, quality=75)
+                self.image = Image.open(temp_webp_file.name)
+                shutil.copyfile(temp_webp_file.name, "test.webp")
 
     def trigger_srs_screenshot_on_clipboard_change(self):
         while True:
@@ -1245,7 +1274,7 @@ class MainHotkeyQObject(QObject):
             self.manager.single_screenshot_signal.connect(master_object.take_single_screenshot)
             self.manager.persistent_window_signal.connect(master_object.show_persistent_screenshot_window)
             self.manager.persistent_screenshot_signal.connect(master_object.take_screenshot_from_persistent_window)
-            self.manager.stop_recording_signal.connect(audio_worker.stop_recording)
+            self.manager.stop_recording_signal.connect(audio_worker.save_audio_and_restart_recording)
             self.start()
 
     def start(self):
@@ -1334,6 +1363,10 @@ class OCR:
     ):
         self.master_object.unprocessed_image = image.copy()
         unprocessed_signal.emit(self.master_object.unprocessed_image)
+        print("got to that point")
+        if self.master_object.config.config_dict["auto_save_recording"]:
+            print("auto save true")
+            self.master_object.audio_worker.save_audio_and_restart_recording()
 
         override_options: list[dict[str, Any]] = [
             {},
@@ -1638,6 +1671,7 @@ class AudioWorker:
     def __init__(self, app: QApplication, config: Configuration):
         self.app = app
         self.config = config
+        self.last_audio_file = ""
         self.audio_recorder_threads: list[AudioWorker.AudioRecorderThread] = []
         self.audio_processing_threads: list[AudioWorker.AudioProcessorThread] = []
 
@@ -1669,15 +1703,14 @@ class AudioWorker:
     @Slot(deque)
     def _process_audio(self, audio_deque: deque):
         print("got finish signal")
-        audio_processing_thread = AudioWorker.AudioProcessorThread(audio_deque)
+        audio_processing_thread = AudioWorker.AudioProcessorThread(audio_deque, self)
         audio_processing_thread.finished.connect(self.clean_up_finished_audio_processing_threads)
         self.audio_processing_threads.append(audio_processing_thread)
         audio_processing_thread.start()
 
     def save_last_file_to_clipboard(self):
-
         data = QMimeData()
-        url = QUrl.fromLocalFile(os.path.abspath("test.mp3"))
+        url = QUrl.fromLocalFile(self.last_audio_file)
         data.setUrls([url])
 
         self.app.clipboard().setMimeData(data)
@@ -1714,8 +1747,9 @@ class AudioWorker:
             print("emitting completed signal")
 
     class AudioProcessorThread(QThread):
-        def __init__(self, audio_deque):
+        def __init__(self, audio_deque, audio_worker: AudioWorker):
             QThread.__init__(self)
+            self.audio_worker = audio_worker
             self.audio_deque = audio_deque
 
         def run(self):
@@ -1759,13 +1793,14 @@ class AudioWorker:
             if final_data.size > 0:
                 logger.info("Converting audio")
                 with NamedTemporaryFile(suffix=".wav") as temp_wav_file:
-                    with NamedTemporaryFile(suffix=".mp3") as temp_mp3_file:
+                    with NamedTemporaryFile(suffix=".opus", delete=False) as temp_opus_file:
                         wavfile.write(temp_wav_file, 48000, final_data)
-                        cmd = ["ffmpeg", "-y", "-i", temp_wav_file.name, temp_mp3_file.name]
+                        cmd = ["ffmpeg", "-y", "-i", temp_wav_file.name, temp_opus_file.name]
                         EasyProcess(cmd).call(timeout=40)
+                        self.audio_worker.last_audio_file = temp_opus_file.name
                         # uncomment below for testing
-                        shutil.copyfile(temp_wav_file.name, "test.wav")
-                        shutil.copyfile(temp_mp3_file.name, "test.mp3")
+                        # shutil.copyfile(temp_wav_file.name, "test.wav")
+                        shutil.copyfile(temp_opus_file.name, "test.opus")
 
 
 def get_loopback_device(mics):
