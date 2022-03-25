@@ -27,7 +27,10 @@ doxapy = "^0.9.1"
 ImageHash = "^4.2.1"
 loguru = "^0.6.0"
 Pillow = "^9.0.1"
-SoundCard = "^0.4.1"
+SoundCard = [
+    { version = "^0.4.1", python = "<3.10" },
+    { git = "https://github.com/bastibe/SoundCard", rev = "8f07897", python = "^3.10" }
+]
 mss = "^6.1.0"
 PySide6 = "^6.2.3"
 
