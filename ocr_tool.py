@@ -161,6 +161,7 @@ class Configuration:
             "enable_srs_image": True,
             "ocr_settings": {
                 "upscale_amount": 3,
+                "enable_thresholding": True,
                 "automatic_thresholding": True,
                 "thresholding_value": 130,
                 "thresholding_algorithm": "OTSU",
@@ -329,25 +330,57 @@ class MainWindow(QWidget):
         ocr_settings_button = QPushButton("OCR Settings")
         ocr_settings_button.clicked.connect(self.show_ocr_settings_window)  # type: ignore
 
-        def toggle_automatic_thresholding(state):
-            if state == Qt.Checked:
-                self.config.config_dict["ocr_settings"]["automatic_thresholding"] = True
-                self.thresholding_slider.setEnabled(False)
-            else:
-                self.config.config_dict["ocr_settings"]["automatic_thresholding"] = False
-                self.thresholding_slider.setEnabled(True)
-            master_object.ocr.start_ocr_in_thread(master_object.unprocessed_image, skip_override=True)
-
         self.ocr_text_linedit_current = QLineEdit("This will contain the latest ocr result")
         self.ocr_text_linedit_last = QLineEdit("This will contain the previous ocr result")
 
-        automatic_thresholding_check_box = QCheckBox("Automatic Thresholding")
-        automatic_thresholding_check_box.setChecked(config.config_dict["ocr_settings"]["automatic_thresholding"])
-        automatic_thresholding_check_box.stateChanged.connect(toggle_automatic_thresholding)  # type: ignore
+        thresholding_widget = QWidget()
+        thresholding_layout = QHBoxLayout()
+        thresholding_layout.setContentsMargins(0, 0, 0, 0)
+        thresholding_widget.setLayout(thresholding_layout)
+
+        def toggle_thresholding(state):
+            if state == Qt.Checked:
+                self.config.config_dict["ocr_settings"]["enable_thresholding"] = True
+                self.automatic_thresholding_check_box.setEnabled(True)
+                self.thresholding_slider.setEnabled(True)
+                self.algorithm_combobox.setEnabled(True)
+            else:
+                self.config.config_dict["ocr_settings"]["enable_thresholding"] = False
+                self.automatic_thresholding_check_box.setEnabled(False)
+                self.thresholding_slider.setEnabled(False)
+                self.algorithm_combobox.setEnabled(False)
+            master_object.ocr.start_ocr_in_thread(master_object.unprocessed_image, skip_override=True)
+
+        self.enable_thresholding_checkbox = QCheckBox("Enable Thresholding")
+        self.enable_thresholding_checkbox.setChecked(config.config_dict["ocr_settings"]["enable_thresholding"])
+        self.enable_thresholding_checkbox.stateChanged.connect(toggle_thresholding)  # type: ignore
+
+        thresholding_layout.addWidget(self.enable_thresholding_checkbox)
+
+        def toggle_automatic_thresholding(state):
+            if state == Qt.Checked:
+                self.config.config_dict["ocr_settings"]["automatic_thresholding"] = True
+                self.thresholding_slider.setEnabled(True)
+                self.algorithm_combobox.setEnabled(True)
+            else:
+                self.config.config_dict["ocr_settings"]["automatic_thresholding"] = False
+                self.thresholding_slider.setEnabled(False)
+                self.algorithm_combobox.setEnabled(False)
+            master_object.ocr.start_ocr_in_thread(master_object.unprocessed_image, skip_override=True)
+
+        self.automatic_thresholding_check_box = QCheckBox("Automatic Thresholding")
+        self.automatic_thresholding_check_box.setChecked(config.config_dict["ocr_settings"]["automatic_thresholding"])
+        self.automatic_thresholding_check_box.stateChanged.connect(toggle_automatic_thresholding)  # type: ignore
+        self.automatic_thresholding_check_box.setEnabled(config.config_dict["ocr_settings"]["enable_thresholding"])
+        thresholding_layout.addWidget(self.automatic_thresholding_check_box)
 
         self.algorithm_combobox = QComboBox()
         self.algorithm_combobox.addItems(list(algorithms))
         self.algorithm_combobox.activated.connect(self.algorithm_change)  # type: ignore
+        self.algorithm_combobox.setEnabled(
+            config.config_dict["ocr_settings"]["enable_thresholding"]
+            and config.config_dict["ocr_settings"]["automatic_thresholding"]
+        )
 
         def change_thresholding_value():
             self.config.config_dict["ocr_settings"]["thresholding_value"] = self.thresholding_slider.value()
@@ -360,7 +393,10 @@ class MainWindow(QWidget):
         self.thresholding_slider.setPageStep(1)
         self.thresholding_slider.setValue(config.config_dict["ocr_settings"]["thresholding_value"])
         self.thresholding_slider.sliderReleased.connect(change_thresholding_value)  # type: ignore
-        self.thresholding_slider.setEnabled(not config.config_dict["ocr_settings"]["automatic_thresholding"])
+        self.thresholding_slider.setEnabled(
+            config.config_dict["ocr_settings"]["enable_thresholding"]
+            and config.config_dict["ocr_settings"]["automatic_thresholding"]
+        )
 
         processed_image = master_object.processed_image
         self.image_preview = ImagePreview(processed_image)
@@ -502,7 +538,7 @@ class MainWindow(QWidget):
         layout.addWidget(self.image_preview)
         layout.addWidget(self.ocr_text_linedit_current)
         layout.addWidget(self.ocr_text_linedit_last)
-        layout.addWidget(automatic_thresholding_check_box)
+        layout.addWidget(thresholding_widget)
         layout.addWidget(self.algorithm_combobox)
         layout.addWidget(self.thresholding_slider)
         layout.addWidget(hotkey_config_button)
@@ -1514,6 +1550,8 @@ class ImageProcessor:
         return image
 
     def threshold_image(self, config_dict: dict, image: Image.Image, is_grayscale: bool):
+        if not config_dict["ocr_settings"]["enable_thresholding"]:
+            return image
         pillow_image: Optional[Image.Image] = None
         if config_dict["ocr_settings"]["automatic_thresholding"]:
             if is_grayscale:
@@ -1530,9 +1568,9 @@ class ImageProcessor:
 
         else:
             opencv_image = self.smart_convert_to_opencv(image)
-            opencv_image = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
-            opencv_image = cv2.threshold(
-                opencv_image, config_dict["ocr_settings"]["thresholding_value"], 255, cv2.THRESH_BINARY
+            opencv_image = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)  # type: ignore
+            opencv_image = cv2.threshold(  # type: ignore
+                opencv_image, config_dict["ocr_settings"]["thresholding_value"], 255, cv2.THRESH_BINARY  # type: ignore
             )[1]
             pillow_image = self.opencv_to_pillow(opencv_image)
         return pillow_image
