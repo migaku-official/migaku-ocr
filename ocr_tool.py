@@ -16,6 +16,7 @@ import doxapy  # type: ignore
 
 import copy
 import io
+import itertools
 import os
 import pathlib
 import platform
@@ -24,7 +25,6 @@ import shutil
 import math
 import sys
 from collections import deque
-from concurrent.futures.thread import ThreadPoolExecutor
 from shutil import which
 from tempfile import NamedTemporaryFile
 from typing import Any, Optional, cast
@@ -39,7 +39,6 @@ import typer
 from appdirs import user_config_dir
 from easyprocess import EasyProcess  # type: ignore
 from loguru import logger
-from superqt import QLabeledSlider
 from PIL import Image, ImageOps, ImageGrab
 from PIL.ImageQt import ImageQt
 from pynput import keyboard  # type: ignore
@@ -134,11 +133,6 @@ def merge(a, b, path=None):
         if key in a:
             if isinstance(a[key], dict) and isinstance(b[key], dict):
                 merge(a[key], b[key], path + [str(key)])
-            elif a[key] == b[key]:
-                pass  # same leaf value
-            else:
-                # a should win in case of conflict
-                pass
         else:
             a[key] = b[key]
     return a
@@ -360,11 +354,11 @@ class MainWindow(QWidget):
         def toggle_automatic_thresholding(state):
             if state == Qt.Checked:
                 self.config.config_dict["ocr_settings"]["automatic_thresholding"] = True
-                self.thresholding_slider.setEnabled(True)
+                self.thresholding_slider.setEnabled(False)
                 self.algorithm_combobox.setEnabled(True)
             else:
                 self.config.config_dict["ocr_settings"]["automatic_thresholding"] = False
-                self.thresholding_slider.setEnabled(False)
+                self.thresholding_slider.setEnabled(True)
                 self.algorithm_combobox.setEnabled(False)
             master_object.ocr.start_ocr_in_thread(master_object.unprocessed_image, skip_override=True)
 
@@ -395,7 +389,7 @@ class MainWindow(QWidget):
         self.thresholding_slider.sliderReleased.connect(change_thresholding_value)  # type: ignore
         self.thresholding_slider.setEnabled(
             config.config_dict["ocr_settings"]["enable_thresholding"]
-            and config.config_dict["ocr_settings"]["automatic_thresholding"]
+            and not config.config_dict["ocr_settings"]["automatic_thresholding"]
         )
 
         processed_image = master_object.processed_image
@@ -411,14 +405,14 @@ class MainWindow(QWidget):
         srs_screenshot_checkbox.setToolTip("A screenshot will be taken that can be added to your SRS cards")
 
         def srs_screenshot_checkbox_toggl(state):
-            self.config.config_dict["enable_srs_image"] = bool(state == Qt.Checked)
+            self.config.config_dict["enable_srs_image"] = state == Qt.Checked
 
         srs_screenshot_checkbox.stateChanged.connect(srs_screenshot_checkbox_toggl)  # type: ignore
         self.texthooker_mode_checkbox = QCheckBox("Texthooker mode 🛈")
         self.texthooker_mode_checkbox.setChecked(config.config_dict["texthooker_mode"])
 
         def texthooker_mode_checkbox_toggl(state):
-            self.config.config_dict["texthooker_mode"] = bool(state == Qt.Checked)
+            self.config.config_dict["texthooker_mode"] = state == Qt.Checked
             if state == Qt.Checked:
                 self.srs_screenshot.start_texthooker_mode()
 
@@ -696,15 +690,14 @@ class SRSScreenshot:
             self.srs_image_location.x2 = size.width()
             self.srs_image_location.y2 = size.height()
 
-        image = ImageGrab.grab(
+        if image := ImageGrab.grab(
             bbox=(
                 int(self.srs_image_location.x1),
                 int(self.srs_image_location.y1),
                 int(self.srs_image_location.x2),
                 int(self.srs_image_location.y2),
             ),
-        )
-        if image:
+        ):
             MAX_SIZE = (848, 480)
             image.thumbnail(MAX_SIZE)
             with NamedTemporaryFile(suffix=".webp", delete=False) as temp_webp_file:
@@ -881,7 +874,7 @@ class HotKeySettingsWindow(QWidget):
         self.setLayout(layout)
 
     def checkbox_toggl(self, state):
-        self.config.config_dict["enable_global_hotkeys"] = bool(state == Qt.Checked)
+        self.config.config_dict["enable_global_hotkeys"] = state == Qt.Checked
 
     def save_close(self):
         self.config.save_config()
@@ -965,7 +958,7 @@ class KeySequenceLineEdit(QLineEdit):
         return tmp
 
     def getQtText(self, pynputText):
-        tmp = re.sub(r"([A-Z])", lambda match: "Shift+" + match.group(1).lower(), pynputText)
+        tmp = re.sub(r"([A-Z])", lambda match: f"Shift+{match.group(1).lower()}", pynputText)
         tmp = re.sub(r"<f(\d{1,2})>", r"F\1", tmp)
         tmp = re.sub(r"([a-z])$", lambda match: match.group(1).upper(), tmp)
         tmp = tmp.replace("<ctrl>", "Ctrl")
@@ -1095,7 +1088,7 @@ class PersistentWindow(QWidget):
             def make_size_follow_cursor():
                 w = max(50, self.drag_w + event.globalPosition().x() - self.drag_x)
                 h = max(50, self.drag_h + event.globalPosition().y() - self.drag_y)
-                self.resize(w, h)
+                self.resize(int(w), int(h))
                 # self.overlay = QPixmap(w, h)
                 # self.overlay.fill(Qt.transparent)
 
@@ -1200,8 +1193,7 @@ class MasterObject:
 
     def show_persistent_screenshot_window(self):
         x1, y1, x2, y2 = self.get_persistent_window_coordinates()
-        temp_rectangle = Rectangle(x1, y1, x2, y2)
-        if temp_rectangle:
+        if temp_rectangle := Rectangle(x1, y1, x2, y2):
             self.persistent_window = PersistentWindow(
                 self,
                 x=temp_rectangle.x1,
@@ -1241,10 +1233,7 @@ class MasterObject:
         self.srs_screenshot.take_srs_screenshot_in_thread()
         persistent_window = self.persistent_window
         x1, y1, x2, y2 = self.get_persistent_window_coordinates()
-        temp_rectangle = Rectangle(x1, y1, x2, y2)
-        if not temp_rectangle:
-            logger.warning("persistent window not initialized yet or persistent_window location not saved")
-        else:
+        if Rectangle(x1, y1, x2, y2):
             x1, y1, x2, y2 = self.get_persistent_window_coordinates()
             image = ImageGrab.grab(bbox=(x1, y1, x2, y2))
             if image and persistent_window and persistent_window.ocrButton.isVisible():
@@ -1254,11 +1243,12 @@ class MasterObject:
                 width = button.width()
                 height = button.height()
                 color = image.getpixel((x1 - 1, y1 + height - 2))
-                for x in range(width):
-                    for y in range(height):
-                        image.putpixel((x1 + x, y1 + y), color)
+                for x, y in itertools.product(range(width), range(height)):
+                    image.putpixel((x1 + x, y1 + y), color)
 
             self.ocr.start_ocr_in_thread(image)
+        else:
+            logger.warning("persistent window not initialized yet or persistent_window location not saved")
 
     def start_auto_ocr_in_thread(self):
         self.auto_ocr_thread = MasterObject.AutoOcrThread(self)
@@ -1278,19 +1268,17 @@ class MasterObject:
             changing = False
             while not self.stop_signal:
                 x1, y1, x2, y2 = self.master_object.get_persistent_window_coordinates()
-                temp_rectangle = Rectangle(x1, y1, x2, y2)
-                if temp_rectangle:
+                if Rectangle(x1, y1, x2, y2):
                     new_hash = imagehash.average_hash(ImageGrab.grab(bbox=(x1, y1, x2, y2)))
                     if not hash1:
                         self.persistent_auto_signal.emit()
                         hash1 = new_hash
+                    elif hash1 == new_hash:
+                        if changing:
+                            self.persistent_auto_signal.emit()
+                            changing = False
                     else:
-                        if hash1 == new_hash:
-                            if changing:
-                                self.persistent_auto_signal.emit()
-                                changing = False
-                        else:
-                            changing = True
+                        changing = True
                     hash1 = new_hash
                     time.sleep(0.3)
                 else:
@@ -1453,7 +1441,7 @@ class OCR:
         width, height = image.size
         language = ""
         path = ""
-        if platform.system() == "Windows":
+        if platform.system() == "Windows" and tesseract_command:
             path = os.path.abspath(tesseract_command)
             pytesseract.pytesseract.tesseract_cmd = path
         # else:
@@ -1528,18 +1516,17 @@ class ImageProcessor:
 
         width, height = image.size
         diff = 0
-        for x in range(width):
-            for y in range(height):
-                if len(pixels[x, y]) == 3:
-                    r, g, b = pixels[x, y]
-                elif len(pixels[x, y]) == 4:
-                    r, g, b, _ = pixels[x, y]
-                else:
-                    return False
-                rg = abs(r - g)
-                rb = abs(r - b)
-                gb = abs(g - b)
-                diff += rg + rb + gb
+        for x, y in itertools.product(range(width), range(height)):
+            if len(pixels[x, y]) == 3:
+                r, g, b = pixels[x, y]
+            elif len(pixels[x, y]) == 4:
+                r, g, b, _ = pixels[x, y]
+            else:
+                return False
+            rg = abs(r - g)
+            rb = abs(r - b)
+            gb = abs(g - b)
+            diff += rg + rb + gb
         abs_diff = diff / (height * width)
         return abs_diff < 5
 
@@ -1549,10 +1536,9 @@ class ImageProcessor:
         image = image.resize((image.width * upscale_amount, image.height * upscale_amount))
         return image
 
-    def threshold_image(self, config_dict: dict, image: Image.Image, is_grayscale: bool):
+    def threshold_image(self, config_dict: dict, image: Image.Image, is_grayscale: bool) -> Image.Image:
         if not config_dict["ocr_settings"]["enable_thresholding"]:
             return image
-        pillow_image: Optional[Image.Image] = None
         if config_dict["ocr_settings"]["automatic_thresholding"]:
             if is_grayscale:
                 return image
@@ -1564,7 +1550,7 @@ class ImageProcessor:
             doxa = doxapy.Binarization(algorithm)
             doxa.initialize(grayscale_image)
             doxa.to_binary(binary_image, {"window": 75, "k": 0.2})
-            pillow_image = self.doxa_to_pillow(binary_image)
+            return self.doxa_to_pillow(binary_image)
 
         else:
             opencv_image = self.smart_convert_to_opencv(image)
@@ -1572,8 +1558,7 @@ class ImageProcessor:
             opencv_image = cv2.threshold(  # type: ignore
                 opencv_image, config_dict["ocr_settings"]["thresholding_value"], 255, cv2.THRESH_BINARY  # type: ignore
             )[1]
-            pillow_image = self.opencv_to_pillow(opencv_image)
-        return pillow_image
+            return self.opencv_to_pillow(opencv_image)
 
     def smart_convert_to_pillow(self, image: Union[numpy.ndarray, Image.Image]) -> Image.Image:
         if isinstance(image, numpy.ndarray):
@@ -1629,7 +1614,6 @@ class ImageProcessor:
 
 def process_text(text: str):
     if text:
-        pass
         pyperclip.copy(text)
 
 
@@ -1805,10 +1789,7 @@ class AudioWorker:
                 def strip_silent_audio_generic(audio_data):
                     audio_counter = 0
                     for audio in audio_data:
-                        is_silent = True
-                        for single_channel_sound in audio:
-                            if single_channel_sound:
-                                is_silent = False
+                        is_silent = not any(audio)
                         audio_counter += 1
                         if not is_silent:
                             break
@@ -1849,11 +1830,8 @@ def get_loopback_device(mics):
     loopback = None
 
     def get_loopback(mics, default_speaker):
-        loopback = None
-        for mic in mics:
-            if mic.isloopback and default_speaker.name in mic.name:
-                loopback = mic
-                break
+        loopback = next((mic for mic in mics if mic.isloopback and default_speaker.name in mic.name), None)
+
         if not loopback:
             for mic in mics:
                 if default_speaker.name in mic.name:
