@@ -3,6 +3,7 @@ name = "test-ocr"
 version = "0.1.0"
 description = ""
 authors = ["JuliusMigaku"]
+license = "gpl2"
 
 [tool.poetry.dependencies]
 python = ">=3.9,<3.11"
@@ -17,22 +18,18 @@ typer = "^0.3.2"
 pynput = "^1.7.3"
 xlib = "^0.21"
 appdirs = "^1.4.4"
-# SoundCard = { git = "https://github.com/bastibe/SoundCard", rev = "8f07897" }
 scipy = "^1.7.3"
 tomli = "^2.0.0"
 tomli-w = "^1.0.0"
-superqt = "^0.2.5"
 opencv-python = "^4.5.5"
 doxapy = "^0.9.1"
 ImageHash = "^4.2.1"
 loguru = "^0.6.0"
 Pillow = "^9.0.1"
-SoundCard = [
-    { version = "^0.4.1", python = "<3.10" },
-    { git = "https://github.com/bastibe/SoundCard", rev = "8f07897", python = "^3.10" }
-]
 mss = "^6.1.0"
-PySide6 = "^6.2.3"
+PySide6 = "^6.2.4"
+superqt = "^0.3.1"
+soundcard = "^0.4.2"
 
 [tool.poetry.dev-dependencies]
 mypy = "^0.910"
