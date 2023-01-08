@@ -8,12 +8,11 @@ import contextlib
 import signal
 
 from typing import Union
-from PIL.PyAccess import PyAccess
 
 
 import cv2  # type: ignore
-import doxapy  # type: ignore
 
+import appdirs
 import copy
 import io
 import itertools
@@ -28,6 +27,8 @@ from collections import deque
 from shutil import which
 from tempfile import NamedTemporaryFile
 from typing import Any, Optional, cast
+import subprocess
+
 
 import numpy
 import pyperclip  # type: ignore
@@ -104,6 +105,82 @@ if not tesseract_command:
 if not ffmpeg_command:
     ffmpeg_command = which("ffmpeg")
 
+
+class ProgressWindow(QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Migaku Download Window")
+        self.setWindowFlags(Qt.WindowStaysOnTopHint) # type: ignore
+        self.setWindowModality(Qt.WindowModal)
+        self.setBaseSize(400, 100)
+
+        self.downlods_dict = {}
+        self.download_list_layout = QVBoxLayout()
+        self.setLayout(self.download_list_layout)
+
+    def add_download_item(self, item: str):
+        self.downlods_dict[item] = QProgressBar()
+        self.downlods_dict[item].setValue(0)
+        self.download_list_layout.addWidget(QLabel(item))
+        self.download_list_layout.addWidget(self.downlods_dict[item])
+
+    def update_progress(self, item: str, value: int):
+        self.downlods_dict[item].setValue(value)
+
+
+class ProgramManager:
+    BASE_DOWNLOAD_URI = "https://migaku-public-data.s3.filebase.com/"
+
+    def __init__(self, program_name: str):
+        self.program_path = None
+        self.program_name = program_name
+        self.download_uri = self.BASE_DOWNLOAD_URI + program_name + "/"
+
+        self.program_executable_name = f"{program_name}.exe" if platform.system() == "Windows" else program_name
+
+        self.migaku_shared_path = appdirs.user_data_dir("MigakuShared", "Migaku")
+        self.shared_user_program_name = os.path.join(self.migaku_shared_path, self.program_executable_name)
+
+        self.make_available()
+
+    def make_available(self):
+        # Attempt global installation
+        if self.check_set_program_path(self.program_executable_name):
+            return
+
+        if self.check_set_program_path(self.shared_user_program_name):
+            return
+
+        self.start_download()
+
+    def start_download(self):
+        class DownloadThread(QThread):
+            def __init__(self, target=None, parent=None):
+                super().__init__(parent)
+                self.target = target
+
+            def run(self):
+                self.target()
+
+        aqt.mw.progress.start(label=f"Downloading ffmpeg and ffprobe", max=100)
+
+        self.program_path = self.migaku_shared_path + "/" + self.program_executable_name
+        print(self.program_path)
+        download_thread = DownloadThread(self._download, self.parent())
+        download_thread.finished.connect(self.finished_download)
+        download_thread.start()
+
+    def check_set_program_path(self, path):
+        if not path:
+            return False
+        try:
+            subprocess.call([path, "-version"])
+            self.program_path = path
+            return True
+        except OSError:
+            return False
+
+
 selected_mic = None
 
 
@@ -151,17 +228,14 @@ class Configuration:
             "texthooker_mode": False,
             "enable_recording": False,
             "auto_save_recording": False,
-            "recording_seconds": 20,
+            "recording_seconds": 8,
             "enable_srs_image": True,
             "ocr_settings": {
                 "upscale_amount": 3,
                 "enable_thresholding": True,
-                "automatic_thresholding": True,
                 "thresholding_value": 130,
-                "thresholding_algorithm": "OTSU",
                 "smart_image_inversion": True,
                 "add_border": True,
-                "character_blacklist": "",
             },
         }
         self.config_dict: dict[str, Any]
@@ -191,19 +265,6 @@ class Configuration:
             tomli_w.dump(self.config_dict, f)
 
 
-algorithms = {
-    "OTSU": doxapy.Binarization.Algorithms.OTSU,
-    "BERNSEN": doxapy.Binarization.Algorithms.BERNSEN,
-    "NIBLACK": doxapy.Binarization.Algorithms.NIBLACK,
-    "SAUVOLA": doxapy.Binarization.Algorithms.SAUVOLA,
-    "WOLF": doxapy.Binarization.Algorithms.WOLF,
-    "NICK": doxapy.Binarization.Algorithms.NICK,
-    "TRSINGH": doxapy.Binarization.Algorithms.TRSINGH,
-    "BATAINEH": doxapy.Binarization.Algorithms.BATAINEH,
-    "ISAUVOLA": doxapy.Binarization.Algorithms.ISAUVOLA,
-    "WAN": doxapy.Binarization.Algorithms.WAN,
-    "GATOS": doxapy.Binarization.Algorithms.GATOS,
-}
 valid_keys = {
     Qt.Key_0: "0",
     Qt.Key_1: "1",
@@ -335,15 +396,11 @@ class MainWindow(QWidget):
         def toggle_thresholding(state):
             if state == Qt.Checked:
                 self.config.config_dict["ocr_settings"]["enable_thresholding"] = True
-                self.automatic_thresholding_check_box.setEnabled(True)
                 self.thresholding_slider.setEnabled(True)
-                self.algorithm_combobox.setEnabled(True)
             else:
                 self.config.config_dict["ocr_settings"]["enable_thresholding"] = False
-                self.automatic_thresholding_check_box.setEnabled(False)
                 self.thresholding_slider.setEnabled(False)
-                self.algorithm_combobox.setEnabled(False)
-            master_object.ocr.start_ocr_in_thread(master_object.unprocessed_image, skip_override=True)
+            master_object.ocr.start_ocr_in_thread(master_object.unprocessed_image)
 
         self.enable_thresholding_checkbox = QCheckBox("Enable Thresholding")
         self.enable_thresholding_checkbox.setChecked(config.config_dict["ocr_settings"]["enable_thresholding"])
@@ -351,46 +408,18 @@ class MainWindow(QWidget):
 
         thresholding_layout.addWidget(self.enable_thresholding_checkbox)
 
-        def toggle_automatic_thresholding(state):
-            if state == Qt.Checked:
-                self.config.config_dict["ocr_settings"]["automatic_thresholding"] = True
-                self.thresholding_slider.setEnabled(False)
-                self.algorithm_combobox.setEnabled(True)
-            else:
-                self.config.config_dict["ocr_settings"]["automatic_thresholding"] = False
-                self.thresholding_slider.setEnabled(True)
-                self.algorithm_combobox.setEnabled(False)
-            master_object.ocr.start_ocr_in_thread(master_object.unprocessed_image, skip_override=True)
-
-        self.automatic_thresholding_check_box = QCheckBox("Automatic Thresholding")
-        self.automatic_thresholding_check_box.setChecked(config.config_dict["ocr_settings"]["automatic_thresholding"])
-        self.automatic_thresholding_check_box.stateChanged.connect(toggle_automatic_thresholding)  # type: ignore
-        self.automatic_thresholding_check_box.setEnabled(config.config_dict["ocr_settings"]["enable_thresholding"])
-        thresholding_layout.addWidget(self.automatic_thresholding_check_box)
-
-        self.algorithm_combobox = QComboBox()
-        self.algorithm_combobox.addItems(list(algorithms))
-        self.algorithm_combobox.activated.connect(self.algorithm_change)  # type: ignore
-        self.algorithm_combobox.setEnabled(
-            config.config_dict["ocr_settings"]["enable_thresholding"]
-            and config.config_dict["ocr_settings"]["automatic_thresholding"]
-        )
-
         def change_thresholding_value():
             self.config.config_dict["ocr_settings"]["thresholding_value"] = self.thresholding_slider.value()
             print(f"thresholding: {self.thresholding_slider.value()}")
             print(f"image: {master_object.unprocessed_image}")
-            self.master_object.ocr.start_ocr_in_thread(master_object.unprocessed_image, skip_override=True)
+            self.master_object.ocr.start_ocr_in_thread(master_object.unprocessed_image)
 
         self.thresholding_slider = QSlider(Qt.Horizontal)
         self.thresholding_slider.setRange(0, 255)
         self.thresholding_slider.setPageStep(1)
         self.thresholding_slider.setValue(config.config_dict["ocr_settings"]["thresholding_value"])
         self.thresholding_slider.sliderReleased.connect(change_thresholding_value)  # type: ignore
-        self.thresholding_slider.setEnabled(
-            config.config_dict["ocr_settings"]["enable_thresholding"]
-            and not config.config_dict["ocr_settings"]["automatic_thresholding"]
-        )
+        self.thresholding_slider.setEnabled(config.config_dict["ocr_settings"]["enable_thresholding"])
 
         processed_image = master_object.processed_image
         self.image_preview = ImagePreview(processed_image)
@@ -533,7 +562,6 @@ class MainWindow(QWidget):
         layout.addWidget(self.ocr_text_linedit_current)
         layout.addWidget(self.ocr_text_linedit_last)
         layout.addWidget(thresholding_widget)
-        layout.addWidget(self.algorithm_combobox)
         layout.addWidget(self.thresholding_slider)
         layout.addWidget(hotkey_config_button)
         layout.addWidget(srs_screenshot_widget1)
@@ -553,10 +581,6 @@ class MainWindow(QWidget):
             self.master_object.auto_ocr_thread.wait()
         else:
             self.master_object.start_auto_ocr_in_thread()
-
-    def algorithm_change(self):
-        self.config.config_dict["ocr_settings"]["thresholding_algorithm"] = self.algorithm_combobox.currentText()
-        self.master_object.ocr.start_ocr_in_thread(self.master_object.unprocessed_image, skip_override=True)
 
     def update_linedit_text(self, text: str):
         self.ocr_text_linedit_last.setText(self.ocr_text_linedit_current.text())
@@ -807,17 +831,10 @@ class OCRSettingsWindow(QWidget):
         upscale_spinbox.valueChanged.connect(change_upscale_value)  # type: ignore
         right_side_layout.addWidget(upscale_spinbox)
 
-        self.blacklist_lineedit = QLineEdit(self.config.config_dict["ocr_settings"]["character_blacklist"])
-        self.blacklist_lineedit.editingFinished.connect(self.change_blacklist_text)  # type: ignore
-        right_side_layout.addWidget(self.blacklist_lineedit)
-
         right_side_widget = QWidget()
         right_side_widget.setLayout(right_side_layout)
         layout.addWidget(right_side_widget)
         self.setLayout(layout)
-
-    def change_blacklist_text(self):
-        self.config.config_dict["ocr_settings"]["character_blacklist"] = self.blacklist_lineedit.text()
 
     def refresh_unprocessed_image(self, image):
         im = ImageQt(image).copy()
@@ -1349,22 +1366,22 @@ class OCR:
         processed_signal = cast(SignalInstance, Signal(Image.Image))
         ocr_text_signal = cast(SignalInstance, Signal(str))
 
-        def __init__(self, ocr: OCR, image, skip_override: bool):
+        def __init__(self, ocr: OCR, image):
             QThread.__init__(self)
             self.image = image
             self.ocr = ocr
-            self.skip_override = skip_override
 
         def run(self):
-            self.ocr.start_ocr(
-                self.image, self.unprocessed_signal, self.processed_signal, self.ocr_text_signal, self.skip_override
-            )
+            self.ocr.start_ocr(self.image, self.unprocessed_signal, self.processed_signal, self.ocr_text_signal)
 
-    def start_ocr_in_thread(self, image, skip_override=False):
+    def start_ocr_in_thread(
+        self,
+        image,
+    ):
         if image:
             if self.ocr_thread:
                 self.ocr_thread.wait()
-            self.ocr_thread = OCR.OCRThread(self, image, skip_override)
+            self.ocr_thread = OCR.OCRThread(self, image)
             ocr_settings_window = self.master_object.main_window.ocr_settings_window
             main_window = self.master_object.main_window
             if ocr_settings_window:
@@ -1383,59 +1400,21 @@ class OCR:
         unprocessed_signal: SignalInstance,
         processed_signal: SignalInstance,
         ocr_text_signal: SignalInstance,
-        skip_override: bool,
     ):
         self.master_object.unprocessed_image = image.copy()
         unprocessed_signal.emit(self.master_object.unprocessed_image)
-        print("got to that point")
         if self.master_object.config.config_dict["auto_save_recording"]:
-            print("auto save true")
             self.master_object.audio_worker.save_audio_and_restart_recording()
 
-        override_options: list[dict[str, Any]] = [
-            {},
-            {"ocr_settings": {"automatic_thresholding": True, "thresholding_algorithm": "OTSU"}},
-            {"ocr_settings": {"automatic_thresholding": True, "thresholding_algorithm": "NICK"}},
-            {"ocr_settings": {"automatic_thresholding": True, "thresholding_algorithm": "WAN"}},
-            {"invert_color": True},
-        ]
-        if skip_override:
-            override_options = [{}]
-
         image_processor = ImageProcessor(self.master_object.config, image)
-        text = ""
-        initial_text = ""
-        initial_image = None
-        for retries, override_option in enumerate(override_options):
-            image = image_processor.process_image(override_option)
-            text = self.do_ocr(image)
-            if retries == 0:
-                initial_text = text
-                initial_image = image.copy()
-            if not self.retry_necessary(text):
-                break
-            elif retries == len(override_options) - 1:
-                text = initial_text
-                assert initial_image is not None
-                image = initial_image
-                if not skip_override:
-                    logger.info("Failed with all override_options, original text might contain blacklisted chars")
-            if not skip_override:
-                logger.info(
-                    f"Ocr failed, retrying with option {override_option} retries: {retries} recognized text: {text}"
-                )
+        image = image_processor.process_image()
+        text = self.do_ocr(image)
 
         processed_signal.emit(image)
         self.master_object.processed_image = image
         ocr_text_signal.emit(text)
 
         process_text(text)
-
-    def retry_necessary(self, text):
-        config = self.master_object.config
-        if not text.strip():
-            return True
-        return any(char.lower() in config.config_dict["ocr_settings"]["character_blacklist"] for char in text)
 
     def do_ocr(self, image: Image.Image):
         width, height = image.size
@@ -1460,6 +1439,7 @@ class OCR:
             (" ", ""),
             ("いぃ", "い"),
             ("\n", ""),
+            ("`", "「"),
             ("①", "１"),
             ("②", "２"),
             ("③", "３"),
@@ -1492,14 +1472,15 @@ class ImageProcessor:
         self.original_image = original_image
         self.inverted = False
 
-    def process_image(self, override_option: dict[str, Any]) -> Image.Image:
-        override_option_copy = override_option.copy()
-        config_dict = merge(override_option_copy, self.config.config_dict.copy())
+    def process_image(self, override_option: Optional[dict[str, Any]] = None) -> Image.Image:
+        config_dict = self.config.config_dict
+        if override_option:
+            override_option_copy = override_option.copy()
+            config_dict = merge(override_option_copy, self.config.config_dict.copy())
         image = self.original_image.copy()
-        is_grayscale = self.check_if_is_grayscale(image)
 
         image = self.increase_image_size(config_dict, image)
-        image = self.threshold_image(config_dict, image, is_grayscale)
+        image = self.threshold_image(config_dict, image)
         image = self.smart_invert_image(config_dict, image)
         image = self.add_border(image)
 
@@ -1511,47 +1492,15 @@ class ImageProcessor:
         else:
             return image
 
-    def check_if_is_grayscale(self, image: Image.Image) -> bool:
-        pixels = cast(PyAccess, image.load())
-
-        width, height = image.size
-        diff = 0
-        for x, y in itertools.product(range(width), range(height)):
-            if len(pixels[x, y]) == 3:
-                r, g, b = pixels[x, y]
-            elif len(pixels[x, y]) == 4:
-                r, g, b, _ = pixels[x, y]
-            else:
-                return False
-            rg = abs(r - g)
-            rb = abs(r - b)
-            gb = abs(g - b)
-            diff += rg + rb + gb
-        abs_diff = diff / (height * width)
-        return abs_diff < 5
-
     def increase_image_size(self, config_dict: dict, image: Union[numpy.ndarray, Image.Image]) -> Image.Image:
         image = self.smart_convert_to_pillow(image)
         upscale_amount = config_dict["ocr_settings"]["upscale_amount"]
         image = image.resize((image.width * upscale_amount, image.height * upscale_amount))
         return image
 
-    def threshold_image(self, config_dict: dict, image: Image.Image, is_grayscale: bool) -> Image.Image:
+    def threshold_image(self, config_dict: dict, image: Image.Image) -> Image.Image:
         if not config_dict["ocr_settings"]["enable_thresholding"]:
             return image
-        if config_dict["ocr_settings"]["automatic_thresholding"]:
-            if is_grayscale:
-                return image
-            grayscale_image = self.pillow_to_doxa(image)
-            binary_image = numpy.empty(grayscale_image.shape, grayscale_image.dtype)
-
-            algorithm = algorithms[config_dict["ocr_settings"]["thresholding_algorithm"]]
-            # Pick an algorithm from the DoxaPy library and convert the image to binary
-            doxa = doxapy.Binarization(algorithm)
-            doxa.initialize(grayscale_image)
-            doxa.to_binary(binary_image, {"window": 75, "k": 0.2})
-            return self.doxa_to_pillow(binary_image)
-
         else:
             opencv_image = self.smart_convert_to_opencv(image)
             opencv_image = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)  # type: ignore
@@ -1598,12 +1547,12 @@ class ImageProcessor:
 
     # both from: https://stackoverflow.com/a/48602446/8825153
     def opencv_to_pillow(self, opencv_image: numpy.ndarray) -> Image.Image:
-        color_coverted = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2RGB)
+        color_coverted = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2RGB)  # type: ignore
         return Image.fromarray(color_coverted)
 
     def pillow_to_opencv(self, pillow_image: Image.Image) -> numpy.ndarray:
         numpy_image = numpy.array(pillow_image)
-        return cv2.cvtColor(numpy_image, cv2.COLOR_RGB2BGR)
+        return cv2.cvtColor(numpy_image, cv2.COLOR_RGB2BGR)  # type: ignore
 
     def pillow_to_doxa(self, pillow_image: Image.Image) -> numpy.ndarray:
         return numpy.array(pillow_image.convert("L"))
@@ -1715,7 +1664,7 @@ class AudioWorker:
         audio_recorder_thread = AudioWorker.AudioRecorderThread(self.config, self)
         self.audio_recorder_threads.append(audio_recorder_thread)
         audio_recorder_thread.done_signal.connect(self._process_audio)
-        audio_recorder_thread.finished.connect(self.clean_up_finished_audio_recorder_threads)
+        audio_recorder_thread.finished.connect(self.clean_up_finished_audio_recorder_threads)  # type: ignore
         audio_recorder_thread.start()
 
     def stop_recording(self) -> None:
@@ -1724,9 +1673,8 @@ class AudioWorker:
 
     @Slot(deque)
     def _process_audio(self, audio_deque: deque):
-        print("got finish signal")
         audio_processing_thread = AudioWorker.AudioProcessorThread(audio_deque, self)
-        audio_processing_thread.finished.connect(self.clean_up_finished_audio_processing_threads)
+        audio_processing_thread.finished.connect(self.clean_up_finished_audio_processing_threads)  # type: ignore
         self.audio_processing_threads.append(audio_processing_thread)
         audio_processing_thread.start()
 
@@ -1766,7 +1714,6 @@ class AudioWorker:
                     if len(audio_deque) > self.config.config_dict["recording_seconds"]:
                         audio_deque.popleft()
             self.done_signal.emit(audio_deque)
-            print("emitting completed signal")
 
     class AudioProcessorThread(QThread):
         def __init__(self, audio_deque, audio_worker: AudioWorker):
