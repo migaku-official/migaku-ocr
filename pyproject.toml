@@ -6,13 +6,11 @@ authors = ["JuliusMigaku"]
 license = "gpl2"
 
 [tool.poetry.dependencies]
-python = ">=3.9,<3.11"
+python = ">=3.9,<3.12"
 pyscreenshot = "^3.0"
-numpy = "^1.21.1"
-pytesseract = "^0.3.8"
+numpy = "^1.24.1"
+pytesseract = "^0.3.10"
 pyperclip = "^1.8.2"
-deep-translator = "^1.5.0"
-gTTS = "^2.2.3"
 pydub = "^0.25.1"
 typer = "^0.3.2"
 pynput = "^1.7.3"
@@ -21,19 +19,19 @@ appdirs = "^1.4.4"
 scipy = "^1.7.3"
 tomli = "^2.0.0"
 tomli-w = "^1.0.0"
-opencv-python = "^4.5.5"
+opencv-python = "^4.7.0.68"
 doxapy = "^0.9.1"
-ImageHash = "^4.2.1"
+imagehash = "^4.3.1"
 loguru = "^0.6.0"
-Pillow = "^9.0.1"
-mss = "^6.1.0"
-PySide6 = "^6.2.4"
-superqt = "^0.3.1"
+pillow = "^9.4.0"
+mss = "^7.0.1"
+superqt = "^0.4.1"
+pyside6 = "^6.4.1"
 soundcard = "^0.4.2"
 
-[tool.poetry.dev-dependencies]
+[tool.poetry.group.dev.dependencies]
+pyinstaller = "^5.7.0"
 mypy = "^0.910"
-pyinstaller = "^4.5.1"
 flake8 = "*"
 types-toml = "*"
 flake8-bugbear = "*"
@@ -54,7 +52,6 @@ flake8-tuple = "^0.4.1"
 flake8-eradicate = "^1.2.0"
 flake8-broken-line = "^0.4.0"
 flake8-bandit = "^2.1.2"
-
 
 [tool.black]
 line-length = 120
